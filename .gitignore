@@ -1,0 +1,32 @@
+# Swap / hibernation artefacts -- never commit these
+*.img
+*.swap
+swap.img*
+
+# Backups made by setup-hibernate.sh and by hand
+*.bak
+*.bak.*
+*.orig
+*.rej
+*~
+
+# Captured diagnostics: journals, sysfs dumps, suspend-report output.
+# Keep these out by default -- they routinely contain UUIDs, serials,
+# MAC addresses and hostnames.
+*.log
+*.journal
+logs/
+diagnostics/
+suspend-report-*.txt
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.\#*
+\#*\#
+
+# OS
+.DS_Store
+Thumbs.db

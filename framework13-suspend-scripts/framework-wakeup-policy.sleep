@@ -1,0 +1,16 @@
+#!/bin/sh
+# Re-apply the wake-source policy immediately before each sleep operation.
+# $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+#
+# systemd WAITS for system-sleep hooks, so a hang here would stall suspend.
+# The policy script is a single sysfs sweep (milliseconds), but bound it anyway.
+
+[ "${1:-}" = "pre" ] || exit 0
+
+if command -v timeout >/dev/null 2>&1; then
+    timeout 15 /usr/local/sbin/framework-wakeup-policy || :
+else
+    /usr/local/sbin/framework-wakeup-policy || :
+fi
+
+exit 0

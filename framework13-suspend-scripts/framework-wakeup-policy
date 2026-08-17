@@ -1,0 +1,86 @@
+#!/bin/sh
+# Framework 13 AMD (Ryzen 7840U) -- restrict s2idle wake sources.
+#
+# Allowed to wake the machine:
+#   PNP0C0C   power button
+#   PNP0C0D   lid switch
+#   the RTC device subtree (RTC + alarmtimer) -- cannot fire unless software
+#             programs an alarm; required for suspend-then-hibernate.
+#
+# Everything else is disarmed: keyboard, touchpad, AC adapter, USB-C PD ports,
+# USB controllers, USB4/Thunderbolt, PCIe bridges, battery, audio coprocessor.
+#
+# SAFETY: this script refuses to disarm anything unless it has first positively
+# located exactly one power-button node and exactly one lid node. Without that
+# guard a renamed sysfs path would silently disarm all 83 wakeup nodes and
+# leave the machine unwakeable short of a forced power-off.
+
+set -u
+
+TAG=framework-wakeup-policy
+
+log() {
+    echo "$*"
+    command -v logger >/dev/null 2>&1 && logger -t "$TAG" -- "$*" 2>/dev/null || :
+}
+die() { log "ERROR: $*"; log "aborted -- no wakeup policy changes made"; exit 1; }
+
+# ---- 1. Positively discover the sources that MUST survive -------------------
+
+BUTTON=$(find /sys/devices -path '*/PNP0C0C:*/power/wakeup' -type f 2>/dev/null)
+LID=$(find /sys/devices -path '*/PNP0C0D:*/power/wakeup' -type f 2>/dev/null)
+
+[ -n "$BUTTON" ] || die "power button wakeup node not found (PNP0C0C)"
+[ -n "$LID" ]    || die "lid switch wakeup node not found (PNP0C0D)"
+[ "$(printf '%s\n' "$BUTTON" | wc -l)" -eq 1 ] || die "ambiguous power button: $BUTTON"
+[ "$(printf '%s\n' "$LID"    | wc -l)" -eq 1 ] || die "ambiguous lid switch: $LID"
+
+# Resolve the RTC parent dynamically. The literal path is /sys/devices/pnp0/00:00
+# on this machine, but "00:00" is positional and not guaranteed across kernels.
+RTC_DIR=$(readlink -f /sys/class/rtc/rtc0/device 2>/dev/null || :)
+# An empty RTC_DIR would make the case pattern "$RTC_DIR"/* match everything.
+[ -n "$RTC_DIR" ] && [ -d "$RTC_DIR" ] || RTC_DIR=/nonexistent-rtc-sentinel
+
+# ---- 2. Disarm everything else ---------------------------------------------
+
+TMP=$(mktemp) || die "mktemp failed"
+trap 'rm -f "$TMP"' EXIT INT TERM HUP
+find /sys/devices -path '*/power/wakeup' -type f 2>/dev/null > "$TMP"
+
+disarmed=0
+# Redirected (not piped) so $disarmed survives the loop.
+while IFS= read -r f; do
+    case "$f" in
+        "$BUTTON"|"$LID") continue ;;   # quoted -> literal match, no globbing
+        "$RTC_DIR"/*)     continue ;;
+    esac
+    [ "$(cat "$f" 2>/dev/null)" = "enabled" ] || continue
+    if echo disabled > "$f" 2>/dev/null; then
+        disarmed=$((disarmed + 1))
+    else
+        log "WARNING: could not disarm $f"
+    fi
+done < "$TMP"
+
+# ---- 3. Verify the keepers really are still armed ---------------------------
+
+failed=0
+for must in "$BUTTON" "$LID"; do
+    if [ "$(cat "$must" 2>/dev/null)" != "enabled" ]; then
+        echo enabled > "$must" 2>/dev/null || :
+        if [ "$(cat "$must" 2>/dev/null)" = "enabled" ]; then
+            log "WARNING: $must was not armed; re-armed it"
+        else
+            log "CRITICAL: $must is NOT armed and could not be re-armed"
+            failed=1
+        fi
+    fi
+done
+[ "$failed" -eq 0 ] || die "required wake source missing after apply"
+
+# ---- 4. Make future wakes attributable in the journal -----------------------
+
+echo 1 > /sys/power/pm_debug_messages 2>/dev/null || :
+
+log "disarmed $disarmed wake source(s); armed: power button, lid, RTC subtree"
+exit 0

@@ -1,0 +1,30 @@
+// Install to: /etc/polkit-1/rules.d/10-enable-hibernate.rules   (mode 0644)
+// Then:       sudo systemctl restart polkit
+//
+// Re-enable hibernation on Ubuntu.
+//
+// Ubuntu ships /usr/share/polkit-1/rules.d/com.ubuntu.desktop.rules, which
+// returns polkit.Result.NO for the hibernate actions regardless of whether the
+// system can actually hibernate. Upstream systemd's own policy is
+// <allow_active>yes</allow_active>.
+//
+// polkit evaluates .rules files in lexicographic order by basename and stops at
+// the first rule returning a value, so "10-..." wins over "com.ubuntu...".
+//
+// Scoped to local AND active sessions on purpose: that matches upstream's
+// allow_active semantics, and stops a remote desktop session from
+// hibernating the machine out from under you and killing your own access.
+//
+// Note: systemd has no separate suspend-then-hibernate action -- it authorizes
+// against org.freedesktop.login1.hibernate, so this covers that too.
+// hibernate-ignore-inhibit is deliberately NOT granted: overriding inhibitors
+// is a stronger power and should keep its auth_admin default.
+
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.hibernate" ||
+         action.id == "org.freedesktop.login1.hibernate-multiple-sessions" ||
+         action.id == "org.freedesktop.upower.hibernate") &&
+        subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

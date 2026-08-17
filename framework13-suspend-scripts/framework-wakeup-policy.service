@@ -1,0 +1,18 @@
+[Unit]
+Description=Restrict s2idle wake sources to lid switch and power button
+Documentation=https://www.kernel.org/doc/html/latest/arch/x86/amd-debugging.html
+# basic.target is after sysinit.target (udev coldplug), so devices exist, but
+# it is meaningfully earlier than multi-user.target -- less of a boot window
+# where the default wake policy is still in force.
+After=basic.target
+Before=sleep.target
+
+[Service]
+Type=oneshot
+# Keeps the unit visible as "active (exited)" in systemctl status so you can
+# confirm it ran. Without it a successful run reports "inactive (dead)".
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/framework-wakeup-policy
+
+[Install]
+WantedBy=multi-user.target

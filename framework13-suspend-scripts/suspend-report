@@ -1,0 +1,121 @@
+#!/bin/bash
+# Report on the most recent suspend cycle: how long it slept, how much of that
+# was real hardware sleep (s0i3), what woke it, and what it cost in battery.
+set -u
+
+BATT_HIST=$(ls -t /var/lib/upower/history-charge-FRANGWA-*.dat 2>/dev/null | head -1)
+
+ENTRY=$(journalctl -k -o short-unix --no-pager | grep "PM: suspend entry" | tail -1 | cut -d' ' -f1 | cut -d. -f1)
+EXIT=$(journalctl -k -o short-unix --no-pager  | grep "PM: suspend exit"  | tail -1 | cut -d' ' -f1 | cut -d. -f1)
+
+if [ -z "${ENTRY:-}" ] || [ -z "${EXIT:-}" ] || [ "$EXIT" -le "$ENTRY" ]; then
+    echo "No complete suspend cycle found in this boot's journal."
+    exit 1
+fi
+
+# Everything logged from the last suspend entry onward. Kernel messages for a
+# cycle are buffered and flushed at resume, so slicing by line beats slicing
+# by timestamp.
+CYCLE=$(journalctl -k --no-pager | awk '/PM: suspend entry/{b=""} {b=b $0 "\n"} END{printf "%s", b}')
+
+WALL=$((EXIT - ENTRY))
+HW_US=$(cat /sys/power/suspend_stats/last_hw_sleep 2>/dev/null || echo 0)
+WAKES=$(printf '%s' "$CYCLE" | grep -c "Triggering wakeup")
+DEEP=$(printf '%s' "$CYCLE" | grep -c "deepest state")
+SUCCESS=$(cat /sys/power/suspend_stats/success 2>/dev/null)
+FAIL=$(cat /sys/power/suspend_stats/fail 2>/dev/null)
+
+echo "==================== last suspend cycle ===================="
+printf "  slept from   %s\n" "$(date -d "@$ENTRY" '+%Y-%m-%d %H:%M:%S')"
+printf "  woke at      %s\n" "$(date -d "@$EXIT" '+%Y-%m-%d %H:%M:%S')"
+awk -v w="$WALL" 'BEGIN{printf "  duration     %.1f h  (%d s)\n", w/3600, w}'
+echo
+
+echo "-- hardware sleep (s0i3) --"
+awk -v hw="$HW_US" -v w="$WALL" 'BEGIN{
+    h=hw/1000000
+    printf "  last_hw_sleep   %.1f s\n", h
+    if (w>0) {
+        p=100*h/w
+        printf "  residency       %.1f%% of the suspend\n", p
+        if (p>=95)      printf "  verdict         EXCELLENT - deep sleep working\n"
+        else if (p>=80) printf "  verdict         OK - some time not in s0i3\n"
+        else if (p>=40) printf "  verdict         POOR - often failing to reach s0i3\n"
+        else            printf "  verdict         BAD - barely reaching s0i3 at all\n"
+    }
+}'
+echo
+
+echo "-- wakes --"
+# Each "Timekeeping suspended" line is one continuous sleep segment. A single
+# physical action fires a BURST of SCIs on IRQ 9, so counting raw wake lines
+# overstates things badly; counting segments is the honest measure.
+SEGMENTS=$(printf '%s' "$CYCLE" | grep -c "Timekeeping suspended")
+INTERRUPTS=$((SEGMENTS > 0 ? SEGMENTS - 1 : 0))
+echo "  sleep segments:                  $SEGMENTS"
+echo "  times it surfaced and re-slept:  $INTERRUPTS   (want 0)"
+echo "  raw wake signals (IRQ bursts):   $WAKES   (bursty; ignore unless above is >0)"
+echo "  'didn't reach deepest state':    $DEEP   (want 0)"
+echo "  suspend success/fail this boot:  $SUCCESS / $FAIL"
+if [ "$INTERRUPTS" -gt 0 ]; then
+    echo
+    echo "  it surfaced mid-sleep; segment lengths:"
+    printf '%s' "$CYCLE" | grep "Timekeeping suspended" | sed 's/.*kernel: /    /' | tail -12
+    echo "  (all wakes should be IRQ 9 = ACPI SCI = lid or power button;"
+    echo "   any other IRQ means a disarmed source is still getting through)"
+    printf '%s' "$CYCLE" | grep "Triggering wakeup" | sed 's/.*kernel: /    /' | sort -u
+fi
+echo
+
+echo "-- battery across the suspend --"
+# upower CANNOT log while the machine is asleep, so there is no "after" sample
+# in its history until something changes post-resume. Comparing history to
+# history silently compares a reading to itself and reports 0% drain. So:
+# "before" comes from upower history, "now" comes from the live counters, and
+# the time spent awake since resume is deducted.
+BAT=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)
+AC_ON=$(cat /sys/class/power_supply/A{C,CAD,DP*}/online 2>/dev/null | head -1)
+
+if [ -z "${BAT:-}" ]; then
+    echo "  (no battery device found)"
+elif [ "${AC_ON:-0}" = "1" ]; then
+    echo "  on AC right now -- no meaningful drain figure available."
+    echo "  (run this before plugging in, or the awake-time correction is invalid)"
+elif [ -z "${BATT_HIST:-}" ] || [ ! -r "$BATT_HIST" ]; then
+    echo "  (no upower history file -- cannot establish the pre-suspend level)"
+else
+    if [ -r "$BAT/charge_full" ]; then
+        UNIT=charge; FULL=$(cat "$BAT/charge_full"); LEVEL=$(cat "$BAT/charge_now"); DRAW=$(cat "$BAT/current_now")
+    else
+        UNIT=energy; FULL=$(cat "$BAT/energy_full"); LEVEL=$(cat "$BAT/energy_now"); DRAW=$(cat "$BAT/power_now")
+    fi
+    VOLT=$(cat "$BAT/voltage_now" 2>/dev/null || echo 0)
+    BEFORE=$(awk -v s="$ENTRY" '$1<=s {p=$2} END{if(p!="") printf "%.2f", p}' "$BATT_HIST")
+    AWAKE=$(( $(date +%s) - EXIT ))
+
+    if [ -z "${BEFORE:-}" ]; then
+        echo "  (no upower sample from before the suspend -- cannot compute drain)"
+    else
+        awk -v u="$UNIT" -v full="$FULL" -v now="$LEVEL" -v draw="$DRAW" -v volt="$VOLT" \
+            -v before="$BEFORE" -v aw="$AWAKE" -v w="$WALL" 'BEGIN{
+            sh=w/3600; ah=aw/3600
+            if (sh<=0 || full<=0) {print "  (insufficient data)"; exit}
+            start = full*before/100
+            awake_used = draw*ah
+            susp_used  = (start-now) - awake_used
+            watt = (u=="charge") ? (susp_used/1e6)/sh*(volt/1e6) : (susp_used/1e6)/sh
+            awake_w = (u=="charge") ? draw*volt/1e12 : draw/1e6
+            rate = 100*(susp_used/sh)/full
+            printf "  %.0f%% at suspend  ->  %.0f%% now\n", before, 100*now/full
+            printf "  deducted %.1f min awake since resume at %.1f W\n", aw/60, awake_w
+            printf "  consumed asleep  %.1f%% over %.1f h\n", 100*susp_used/full, sh
+            printf "  DRAIN RATE       %.2f %%/hour  ->  %.0f%% per 24 h asleep\n", rate, 24*rate
+            printf "  SUSPEND DRAW     %.2f W\n", watt
+            if (rate<=1.5)     printf "  verdict          GOOD - healthy s0i3 draw\n"
+            else if (rate<=3)  printf "  verdict          OK - higher than ideal\n"
+            else if (rate<=6)  printf "  verdict          HIGH - something is drawing power\n"
+            else               printf "  verdict          VERY HIGH - not sleeping properly\n"
+        }'
+    fi
+fi
+echo "============================================================"
