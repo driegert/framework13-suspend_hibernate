@@ -1,6 +1,11 @@
 #!/bin/sh
 # Re-apply the wake-source policy immediately before each sleep operation.
-# $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+# $1 = pre|post
+# $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+#      |suspend-after-failed-hibernate   (systemd's fallback when hibernation
+#       was attempted and failed -- it re-suspends rather than staying awake)
+#
+# We branch only on $1, so every $2 value is handled without change.
 #
 # systemd WAITS for system-sleep hooks, so a hang here would stall suspend.
 # The policy script is a single sysfs sweep (milliseconds), but bound it anyway.

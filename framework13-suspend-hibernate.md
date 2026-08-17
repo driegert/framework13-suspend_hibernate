@@ -276,13 +276,27 @@ all**, which removed a whole class of risk.
 
 A swap **partition** needs only `resume=UUID=<swap-uuid>` — no `resume_offset`,
 nothing that can drift. But this disk has **0 bytes unallocated**, so it would
-mean shrinking `/home` offline from a live USB with 563 GB of data on it. Not
-worth it.
+mean shrinking `/home` offline from a live USB. At the time, not worth it.
 
 The swapfile's one real weakness: **`resume_offset` is a physical block offset
 baked into the kernel cmdline.** If the swapfile is ever recreated, resized, or
 restored from backup, hibernate still *succeeds* and **resume silently fails,
 losing the session.** → *Re-run the setup script if you ever touch the swapfile.*
+
+> **Revisited, 2026-08-17.** The 26.0 GB image above put the 32 GiB swapfile at
+> 76% full, which makes a resize worth doing — and once you're booting a live USB
+> anyway, the calculus flips: the partition costs nothing extra and removes the
+> offset failure mode permanently.
+>
+> Note the *direction* of the shrink matters enormously. `/home` runs to the end
+> of the disk, so trimming its **right** edge and putting swap in the freed tail
+> relocates only the data in that slice, and leaves `/`, `/home`'s start, and
+> every existing UUID untouched. *Growing `/`* would instead require moving
+> `/home`'s start — relocating all ~508 GB, hours of I/O, and the one operation
+> where a power cut destroys the filesystem. Same live USB, wildly different risk.
+>
+> `setup-hibernate.sh --partition /dev/…` handles the configuration side,
+> including stripping the now-stale `resume_offset`.
 
 ### The procedure
 

@@ -106,7 +106,7 @@ nodes). If it reports 20-something today, this repo is for you.
 | `framework-wakeup-policy` | `/usr/local/sbin/` (0755) | ✅ as-is |
 | `framework-wakeup-policy.service` | `/etc/systemd/system/` (0644) | ✅ as-is |
 | `framework-wakeup-policy.sleep` | `/etc/systemd/system-sleep/framework-wakeup-policy` (0755) | ✅ as-is |
-| `setup-hibernate.sh` | run once with sudo, not installed | ⚠️ check swap size |
+| `setup-hibernate.sh` | run once with sudo, not installed | ⚠️ pick `--file` or `--partition`, check size |
 | `10-enable-hibernate.rules` | `/etc/polkit-1/rules.d/` (0644) | ⚠️ Ubuntu-specific |
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) | ✅ tune to taste |
 | `10-lid-sleep.conf` | `/etc/systemd/logind.conf.d/` (0644) | ✅ tune to taste |
@@ -139,18 +139,52 @@ alarm, and it's a hard prerequisite for Part 3.
 
 ### Part 2 — `setup-hibernate.sh`
 
-Builds a swapfile large enough to hold a hibernation image and wires up
-`resume=` / `resume_offset=` on the kernel command line.
+Provisions somewhere to put the hibernation image and wires up `resume=` on the
+kernel command line. **It offers two paths, and the choice matters more than it
+looks.**
 
-It is written to be safe to interrupt: the new swapfile is fully built
-**before** the old one is torn down, so a failure at any point leaves a
-bootable machine with working swap. The only window without swap is a single
-`rm` + `mv`.
+```sh
+sudo ./setup-hibernate.sh                          # swapfile on / (default)
+sudo ./setup-hibernate.sh --size 48                # ditto, 48 GiB
+sudo ./setup-hibernate.sh --partition /dev/nvme0n1p5   # dedicated swap partition
+```
 
-It refuses to run if it can't verify the ground is solid — non-ext4 filesystem,
-filesystem block size ≠ page size, LVM/LUKS/RAID underneath, not enough free
-space, a `GRUB_CMDLINE_LINUX_DEFAULT` it can't safely edit, or an existing
-`/swap.img` it can't prove is really swap.
+| | `--file` (swapfile) | `--partition` |
+|---|---|---|
+| Repartitioning | none | needs unallocated space, usually a live-USB shrink |
+| Kernel cmdline | `resume=UUID=…` **+ `resume_offset=`** | `resume=UUID=…` only |
+| Fragility | offset breaks if the file is recreated | nothing to drift |
+| `/home` constraint | forced onto `/` by `ProtectHome=yes` | not applicable |
+| Maintenance | **re-run this script if you touch the swapfile** | none |
+
+**The offset is the whole difference.** In swapfile mode, `resume_offset` is a
+*physical block offset* baked into the kernel command line. Recreate, resize or
+restore the swapfile and it goes stale — after which **hibernate still succeeds
+and resume silently fails, losing the session.** A swap partition is located
+purely by UUID, so that failure mode does not exist.
+
+Take the swapfile if you don't want to repartition. **If you're booting a live
+USB anyway, take the partition** — it is strictly more durable, and it also
+frees whatever the swapfile was occupying on `/`.
+
+Both paths are written to be safe to interrupt: the new swap is fully
+established **before** the old is torn down, so a failure at any point leaves a
+bootable machine with working swap.
+
+Both refuse to run unless the ground is provably solid. Swapfile mode checks for
+a non-ext4 filesystem, block size ≠ page size, LVM/LUKS/RAID underneath,
+insufficient free space, a `GRUB_CMDLINE_LINUX_DEFAULT` it can't safely edit, or
+an existing `/swap.img` it can't prove is really swap. Partition mode adds the
+guards that matter when a command is about to run `mkswap`: it refuses whole
+disks, anything mounted, anything backing `/`, `/home`, `/boot` or `/boot/efi`,
+and — without an explicit `--force` — any device holding a filesystem. It then
+requires you to type `YES`.
+
+Switching from a swapfile to a partition is handled: the script strips the stale
+`resume_offset` from the cmdline, comments out the old swap line in
+`/etc/fstab` (backing it up first), and **deliberately leaves `/swap.img` on
+disk** so you still have a fallback until you've confirmed a real hibernate and
+resume. It tells you when it's safe to delete.
 
 ### Part 3 — `10-lid-sleep.conf` + `10-hibernate-delay.conf`
 
@@ -182,12 +216,15 @@ before and after compares a sample to itself and cheerfully reports `0.00
 There are exactly **two** hardcoded machine-specific values. Everything else is
 discovered at runtime.
 
-### 1. Swap size — `setup-hibernate.sh`
+### 1. Swap size — `--size`, or the size of your partition
 
 ```sh
-SWAP_GB=32          # sized for 60 GB of RAM
-SWAPFILE=/swap.img  # Ubuntu desktop's default path; Debian often uses /swapfile
+sudo ./setup-hibernate.sh --size 48                    # swapfile, 48 GiB
+sudo ./setup-hibernate.sh --partition /dev/nvme0n1p5   # size = the partition's
 ```
+
+Swapfile mode defaults to 32 GiB at `/swap.img` (Ubuntu desktop's path; Debian
+often uses `/swapfile` — change `SWAPFILE` at the top of the script if so).
 
 **Swap does not need to equal RAM, but don't cut it fine either.** It needs to
 hold the hibernation image, which is a copy of what's *actually in use*. On this
@@ -210,18 +247,29 @@ free -g                                  # "used" column, at a busy moment
 cat /sys/power/image_size                # kernel's own soft target, 2/5 of RAM
 ```
 
-Rule of thumb: **half your RAM** is a sensible floor, and it's what the 32 GB
-here works out to. Go higher if you routinely run VMs or large datasets — a
-too-small swapfile means hibernation simply fails when you most want it. Confirm
-you have room — the script needs `SWAP_GB + 1` GB free, because both files exist
-at once:
+Rule of thumb: **half your RAM** is a sensible floor, and it's what the 32 GiB
+here works out to. **Swap ≥ RAM** makes it structurally unfailable, and if
+you're sizing a partition you may as well — the space is otherwise idle.
+
+In swapfile mode, confirm you have room for **`--size` + 1 GiB**, because the
+old and new files deliberately exist at the same time:
 
 ```bash
 df -h /
 ```
 
+If `/` can't hold both, the script tells you so and points at `--partition`
+rather than quietly shaving its own safety margin.
+
 > The original 8 GB Ubuntu default swapfile **could never have held the image.**
 > If you're on a stock Ubuntu install, yours is probably 8 GB too.
+
+**What happens if you undersize it?** Not a disaster: systemd logs `Couldn't
+hibernate, will try to suspend again` and falls back to plain suspend (the
+`suspend-after-failed-hibernate` action in `man 8 systemd-sleep`). You keep the
+session and pay the s2idle draw instead of hibernating. Worth knowing — but at
+~0.44 W that's still ~20%/day, so it's a soft landing, not a safety net you'd
+want to rely on over a long weekend.
 
 ### 2. Battery model — `suspend-report`
 
@@ -314,11 +362,42 @@ Residency ≥ 95% and `times it surfaced and re-slept: 0` means Part 1 worked.
 
 ### Step 2 — hibernation
 
-Read the script before running it. It reformats your swap.
+Read the script before running it. It reformats your swap. Pick a path — see
+[Part 2](#part-2--setup-hibernatesh) for the trade-off:
 
 ```sh
-sudo "$D/setup-hibernate.sh"
+sudo "$D/setup-hibernate.sh"                          # swapfile on / (default)
+sudo "$D/setup-hibernate.sh" --size 48                # ditto, larger
+sudo "$D/setup-hibernate.sh" --partition /dev/nvme0n1p5   # dedicated partition
 ```
+
+<details>
+<summary><b>Making room for a swap partition (live USB)</b></summary>
+
+You need unallocated space, and ext4 **can be grown online but never shrunk
+online** — so the shrink has to happen from a live USB with the filesystem
+unmounted.
+
+**Shrink from the END of a partition, never the start.** Shrinking the right
+edge relocates only the data inside the slice you're removing. Moving a
+partition's *start* relocates the entire filesystem — hours of I/O, and the one
+operation where a power cut genuinely destroys data. In GParted this means
+dragging the right edge left and making sure **"free space *preceding*" stays
+0**. If your layout would force a move, prefer the swapfile.
+
+Before you start:
+
+- **Back up the filesystem you're shrinking.** This is the step people skip.
+- Save the partition table: `sudo sfdisk -d /dev/nvme0n1 > partition-table.bak`,
+  plus copies of `/etc/fstab` and `/etc/default/grub`, onto the USB stick.
+- Stay on AC, and make sure the live session won't auto-suspend.
+- Use a current live ISO — an old GParted can baulk at newer ext4 features.
+- `sudo e2fsck -f /dev/…` first; GParted refuses to resize a dirty filesystem.
+
+Shrinking does **not** change the UUIDs of existing partitions, so `/etc/fstab`
+keeps working untouched. Boot normally and confirm the shrunk filesystem is
+intact *before* running `setup-hibernate.sh --partition` on the new space.
+</details>
 
 Then follow its printed instructions **exactly** — there is a step that is very
 easy to miss:
@@ -334,7 +413,7 @@ sudo reboot
 
 # The check that matters. Must NOT be 0:0.
 cat /sys/power/resume          # e.g. 259:3
-cat /sys/power/resume_offset   # e.g. 20113408
+cat /sys/power/resume_offset   # swapfile mode only; 0 is correct for a partition
 ```
 
 **Why twice?** On this system `update-initramfs` is a **dracut** shim, not
@@ -477,6 +556,10 @@ grep -o 'resume_offset=[0-9]*' /proc/cmdline
 sudo filefrag -b4096 -v /swap.img | head -4     # first extent must match
 ```
 
+**This section does not apply to `--partition`.** A swap partition is located by
+UUID with no offset, so there is nothing to go stale and nothing to re-run. If
+you keep hitting this, that's the argument for switching.
+
 Also: **exclude `/swap.img` from backups** (Déjà Dup, Timeshift, rsync).
 
 **Can't wake by typing**
@@ -523,6 +606,7 @@ sudo systemctl restart systemd-logind
 # Hibernation entirely
 sudo rm /etc/polkit-1/rules.d/10-enable-hibernate.rules
 sudo cp /etc/default/grub.bak.<timestamp> /etc/default/grub   # setup-hibernate.sh left this
+sudo cp /etc/fstab.bak.<timestamp> /etc/fstab                 # --partition mode only
 sudo update-initramfs -u -k all && sudo update-grub
 ```
 
@@ -537,10 +621,16 @@ Wake sources return to kernel defaults on the next reboot.
   single failure was the very first one and was never explained. Cycles 1–5 were
   short bench tests, cycle 6 a real overnight run (2 h suspended, then 11 h 44 min
   hibernated, session restored intact).
-- **If the hibernate handoff fails, the machine wakes and stays awake.** The lid
-  is already shut, so no new lid event arrives, and the only backstop is GNOME's
-  30-minute inactivity timeout. In a bag that's worse than plain suspend. It
-  hasn't recurred, but it's the failure mode to know about.
+- **A hibernate that *fails* is handled; one that never *starts* is not.** If
+  systemd attempts hibernation and it fails — image won't fit, resume device
+  missing — it logs `Couldn't hibernate, will try to suspend again` and
+  re-suspends (`suspend-after-failed-hibernate`, documented in
+  `man 8 systemd-sleep`). You land on plain s2idle, not a machine awake in your
+  bag. The unexplained cycle-1 failure was different: it never logged
+  `Attempting to hibernate` at all, so the loop simply exited and the machine
+  stayed awake. With the lid already shut, no new lid event arrives and the only
+  backstop is GNOME's 30-minute inactivity timeout. That's the failure mode to
+  know about; it hasn't recurred in five subsequent cycles.
 - **`/` needs room.** A 32 GB swapfile left ~22 GB free on a 95 GB root
   partition here. Keep an eye on snaps and `/var`.
 - Machine-specific UUIDs in the documentation are placeholders
