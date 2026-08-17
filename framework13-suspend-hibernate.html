@@ -594,7 +594,7 @@ cat /sys/power/resume_offset     # -> 0
 swapon --show                    # -> 8 GB /swap.img</code></pre>
 
   <h3>Swap sizing</h3>
-  <p>The kernel's default <code>image_size</code> is 23.7 GiB (2/5 of RAM). Images observed in practice: <strong>2.37M–2.98M pages ≈ 9.7–12.2 GB</strong>. The original 8 GB swap could never have held one. 32 GB was chosen for real headroom.</p>
+  <p>The kernel's default <code>image_size</code> is 23.7 GiB (2/5 of RAM). Images observed in practice: <strong>2.37M–2.98M pages ≈ 9.7–12.2 GB</strong> across four test cycles shortly after a reboot — but <strong>6.35M pages ≈ 26.0 GB</strong> on the first real overnight run at the end of a working day. The original 8 GB swap could never have held any of them, and that 2.7× spread is the lesson: hibernating a freshly-booted machine tells you nothing about the size you actually need. The 26.0 GB image filled 76% of the 32 GiB swapfile.</p>
   <p>Swap does not need to equal RAM — only to hold the compressed image of what's actually in use.</p>
 
   <h3>Why the swapfile is on <code>/</code> and not <code>/home</code></h3>
@@ -695,7 +695,14 @@ HandleLidSwitchExternalPower=sleep</code></pre>
   <p><code>HibernateOnACPower=no</code> because plugged in the battery isn't draining, so hibernating buys nothing and costs ~18 s of WiFi firmware reload on resume.</p>
 
   <h3>Reliability</h3>
-  <p><strong>5 cycles tested, 4 hibernated.</strong> The single failure was the very first cycle, before debug logging was enabled, and was never explained — same alarm, same <code>IRQ 9</code> wake, same power state, opposite outcome. Cycles 2–5 were consecutive clean successes.</p>
+  <p><strong>6 cycles, 5 hibernated.</strong> The single failure was the very first cycle, before debug logging was enabled, and was never explained — same alarm, same <code>IRQ 9</code> wake, same power state, opposite outcome. Cycles 2–6 were consecutive clean successes.</p>
+
+  <p>Cycles 1–5 were short bench tests with <code>HibernateDelaySec</code> cut to 1–2 min. Cycle 6, on 2026-08-16, was the first <em>real</em> one and the most informative:</p>
+<pre><code>18:57:03  lid closed   -&gt; suspend
+19:57:03  woke to sample the discharge rate, re-suspended
+20:57:03  2 h elapsed  -&gt; hibernate  (6353520 pages, 26.0 GB)
+08:40:58  next morning -&gt; image restored, 11 h 44 min at zero draw</code></pre>
+  <p>The intermediate wake at the 1 h mark is systemd sampling the battery, not a leaked wake source, and <code>HibernateDelaySec=2h</code> was honoured exactly. Resume preserved the boot ID — the same session, unbroken across the night.</p>
   <div class="note trap">
     <span class="tag">The failure mode matters</span>
     <p>If the handoff doesn't happen, the machine <strong>wakes and stays awake</strong>. The lid is already shut so no new lid event arrives; the only backstop is GNOME's <code>sleep-inactive-battery-timeout</code> of 30 minutes. In a bag that is worse than plain suspend.</p>

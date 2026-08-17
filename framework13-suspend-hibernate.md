@@ -240,12 +240,20 @@ swapon --show                    # -> 8 GB /swap.img
 
 ### Swap sizing
 
-The kernel's default `image_size` is 23.7 GiB (2/5 of RAM). The actual images
-observed in practice were **2.37M–2.98M pages ≈ 9.7–12.2 GB**.
+The kernel's default `image_size` is 23.7 GiB (2/5 of RAM). Images observed in
+practice:
 
-**The original 8 GB swap could never have held it.** 32 GB was chosen for real
-headroom. Swap does *not* need to equal RAM — only to hold the compressed image
-of what's actually in use.
+| Cycle | Pages | Size |
+|---|---|---|
+| Test cycles, shortly after a reboot (×4) | 2.37M – 2.98M | 9.7 – 12.2 GB |
+| **First real overnight run, end of a working day** | **6.35M** | **26.0 GB (24.2 GiB)** |
+
+**The original 8 GB swap could never have held any of them.** Swap does *not*
+need to equal RAM — only to hold the image of what's actually in use — but the
+2.7× spread above is the point: **hibernating a freshly-booted machine tells you
+nothing about the size you actually need.** The 26.0 GB image filled **76%** of
+the 32 GiB swapfile, so the headroom is real but not lavish. If `/` ever allows
+it, 40 GB would be the more comfortable number.
 
 ### Why the swapfile is on `/` and not `/home`
 
@@ -424,10 +432,24 @@ Plugged in, the battery isn't draining, so hibernating buys nothing and costs
 
 ### Reliability
 
-**5 cycles tested, 4 hibernated.** The single failure was the very first cycle,
-before debug logging was enabled, and was never explained — same alarm, same
-`IRQ 9` wake, same power state, opposite outcome. Cycles 2–5 were consecutive
-clean successes.
+**6 cycles, 5 hibernated.** The single failure was the very first cycle, before
+debug logging was enabled, and was never explained — same alarm, same `IRQ 9`
+wake, same power state, opposite outcome. Cycles 2–6 were consecutive clean
+successes.
+
+Cycles 1–5 were short bench tests with `HibernateDelaySec` cut to 1–2 min.
+Cycle 6, on 2026-08-16, was the first **real** one and the most informative:
+
+```
+18:57:03  lid closed   -> suspend
+19:57:03  woke to sample the discharge rate, re-suspended
+20:57:03  2 h elapsed  -> hibernate  (6353520 pages, 26.0 GB)
+08:40:58  next morning -> image restored, 11 h 44 min at zero draw
+```
+
+The intermediate wake at the 1 h mark is systemd sampling the battery, not a
+leaked wake source, and `HibernateDelaySec=2h` was honoured exactly. Resume
+preserved boot ID `c38fad9e…` — the same session, unbroken across the night.
 
 > **The failure mode matters:** if the handoff doesn't happen, the machine
 > **wakes and stays awake**. The lid is already shut so no new lid event

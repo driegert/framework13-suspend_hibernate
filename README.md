@@ -189,20 +189,32 @@ SWAP_GB=32          # sized for 60 GB of RAM
 SWAPFILE=/swap.img  # Ubuntu desktop's default path; Debian often uses /swapfile
 ```
 
-**Swap does not need to equal RAM.** It needs to hold the hibernation image,
-which is a compressed copy of what's *actually in use*. On a 60 GB machine the
-real images came out at **9.7–12.2 GB**.
+**Swap does not need to equal RAM, but don't cut it fine either.** It needs to
+hold the hibernation image, which is a copy of what's *actually in use*. On this
+60 GB machine, observed images ranged from **9.7 GB to 26.0 GB** — and that
+spread is the whole lesson:
 
-To size it, check what you actually use, and leave real headroom:
+| When | Image | % of a 32 GiB swapfile |
+|---|---|---|
+| Test cycles shortly after a reboot | 9.7 – 12.2 GB | 28 – 36% |
+| Real session, end of a working day | **26.0 GB** | **76%** |
+
+Hibernating a freshly-booted machine tells you almost nothing. Size for a bad
+day — browser, editors, containers, a VM — not for a quiet one.
+
+To size it, check what you actually use at your *heaviest*, and leave real
+headroom:
 
 ```bash
-free -g                                  # "used" column, at your normal workload
-cat /sys/power/image_size                # kernel's own cap, defaults to 2/5 of RAM
+free -g                                  # "used" column, at a busy moment
+cat /sys/power/image_size                # kernel's own soft target, 2/5 of RAM
 ```
 
-Rule of thumb: **half your RAM** is generous for most people; go higher if you
-routinely run VMs or huge datasets. Confirm you have room for it — the script
-needs `SWAP_GB + 1` GB free, because both files exist at once:
+Rule of thumb: **half your RAM** is a sensible floor, and it's what the 32 GB
+here works out to. Go higher if you routinely run VMs or large datasets — a
+too-small swapfile means hibernation simply fails when you most want it. Confirm
+you have room — the script needs `SWAP_GB + 1` GB free, because both files exist
+at once:
 
 ```bash
 df -h /
@@ -521,8 +533,10 @@ Wake sources return to kernel defaults on the next reboot.
 ## Caveats
 
 - **Sample size of one.** These numbers come from a single machine over a few
-  days. suspend-then-hibernate was tested over 5 cycles, 4 of which hibernated;
-  the single failure was the first cycle and was never explained.
+  days. suspend-then-hibernate has run **6 cycles, 5 of which hibernated**; the
+  single failure was the very first one and was never explained. Cycles 1–5 were
+  short bench tests, cycle 6 a real overnight run (2 h suspended, then 11 h 44 min
+  hibernated, session restored intact).
 - **If the hibernate handoff fails, the machine wakes and stays awake.** The lid
   is already shut, so no new lid event arrives, and the only backstop is GNOME's
   30-minute inactivity timeout. In a bag that's worse than plain suspend. It
