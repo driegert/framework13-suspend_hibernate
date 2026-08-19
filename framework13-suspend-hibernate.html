@@ -330,6 +330,22 @@
   .note.good { border-left-color: var(--ok); background: var(--ok-bg); }
   .note.good .tag { color: var(--ok); }
 
+  /* superseded-section marker */
+  .sup {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--text-3);
+    border: 1px solid var(--border-2);
+    border-radius: 999px;
+    padding: 2px 9px;
+    margin-left: 10px;
+    vertical-align: 2px;
+    white-space: nowrap;
+  }
+
   /* ---- gotcha list ---- */
   .gotchas { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 16px; max-width: var(--measure); }
   .gotchas li {
@@ -373,11 +389,11 @@
 <header class="mast">
   <p class="eyebrow">Framework 13 · AMD Ryzen 7840U · Ubuntu 26.04</p>
   <h1>Tinkertoy Sleep Runbook</h1>
-  <p class="standfirst">Why this laptop wouldn't stay asleep, what was actually wrong, and the five undocumented traps between a working <code>systemctl hibernate</code> and a machine you can shut and put in a bag.</p>
+  <p class="standfirst">Why this laptop wouldn't stay asleep, what was actually wrong, and the undocumented traps between a working <code>systemctl hibernate</code> and a machine you can shut and put in a bag — including one session that was lost anyway, and what its logs gave up.</p>
   <div class="mast-meta">
     <span>kernel 7.0.0-29-generic</span>
     <span>systemd 259</span>
-    <span>investigated 2026-08-12 → 08-16</span>
+    <span>investigated 2026-08-12 → 08-19</span>
   </div>
 </header>
 
@@ -390,11 +406,13 @@
     <li><a href="#s0i3"><span class="num">03</span>Deep sleep</a></li>
     <li><a href="#hibernate"><span class="num">04</span>Hibernation</a></li>
     <li><a href="#sth"><span class="num">05</span>Suspend-then-hibernate</a></li>
-    <li><a href="#files"><span class="num">06</span>Installed files</a></li>
-    <li><a href="#cookbook"><span class="num">07</span>Diagnostics</a></li>
-    <li><a href="#gotchas"><span class="num">08</span>Gotchas</a></li>
-    <li><a href="#trouble"><span class="num">09</span>Troubleshooting</a></li>
-    <li><a href="#undo"><span class="num">10</span>Undo</a></li>
+    <li><a href="#partition"><span class="num">06</span>Swap partition</a></li>
+    <li><a href="#postmortem"><span class="num">07</span>A lost session</a></li>
+    <li><a href="#files"><span class="num">08</span>Installed files</a></li>
+    <li><a href="#cookbook"><span class="num">09</span>Diagnostics</a></li>
+    <li><a href="#gotchas"><span class="num">10</span>Gotchas</a></li>
+    <li><a href="#trouble"><span class="num">11</span>Troubleshooting</a></li>
+    <li><a href="#undo"><span class="num">12</span>Undo</a></li>
   </ol>
 </nav>
 
@@ -429,6 +447,16 @@
       <div class="was">~20%</div>
       <div class="now">~1.6%</div>
     </div>
+    <div class="metric">
+      <div class="lbl">Swap</div>
+      <div class="was">32 GB file, 61 extents</div>
+      <div class="now">64 GB partition</div>
+    </div>
+    <div class="metric">
+      <div class="lbl">Hibernate reserve</div>
+      <div class="was">2% battery</div>
+      <div class="now">7%</div>
+    </div>
   </div>
 
   <h3>Sleep path now</h3>
@@ -446,7 +474,7 @@
     <div class="st cold">
       <div class="n">RTC alarm fires</div>
       <div class="v">Hibernate</div>
-      <div class="d">~12 GB image to /swap.img, full power-off</div>
+      <div class="d">~12 GB image to /dev/nvme0n1p5, full power-off</div>
     </div>
     <div class="st cold">
       <div class="n">Indefinite</div>
@@ -459,7 +487,7 @@
   <ul>
     <li><strong>Only the lid and the power button wake it.</strong> Keyboard and touchpad will not — that is configured, not broken.</li>
     <li><strong>Lid closed with an external monitor → stays awake.</strong> Clamshell mode, intended.</li>
-    <li><strong>On AC it suspends but never hibernates.</strong> The battery isn't draining, so there's nothing to save.</li>
+    <li><strong>On AC it suspends and stays suspended</strong> — but unplug it and the 2 h countdown starts from that moment.</li>
     <li><strong>Unplugging the charger no longer wakes it</strong> — the complaint that started all this.</li>
   </ul>
 </section>
@@ -472,12 +500,14 @@ BIOS 03.20 (all firmware current per fwupdmgr)
 Secure Boot: disabled          kernel lockdown: [none]
 RAM: 59.4 GiB                  page size: 4096
 
-/dev/nvme0n1  (1 TB, WD SN850X)  — partition table FULL, 0 B unallocated
+/dev/nvme0n1  (1 TB, WD SN850X)
   p1   977M  ext4  /boot
   p2     1G  vfat  /boot/efi
   p3  95.4G  ext4  /       UUID &lt;your-root-uuid&gt;
-  p4 834.1G  ext4  /home   UUID &lt;your-home-uuid&gt;
+  p4 770.1G  ext4  /home   UUID &lt;your-home-uuid&gt;
+  p5    64G  swap          UUID &lt;your-swap-uuid&gt;   ← added 2026-08-19
 No LUKS, no LVM, no RAID.</code></pre>
+  <p>Until 2026-08-19 the table was <strong>full</strong> — 0 B unallocated, with <code>p4</code> running to the end of the disk. That single constraint shaped every decision in Part three.</p>
 
   <div class="note why">
     <span class="tag">The fact everything hangs on</span>
@@ -604,14 +634,19 @@ swapon --show                    # -> 8 GB /swap.img</code></pre>
   <p>logind runs with <code>/home</code> hidden from it, so it cannot <code>stat()</code> a swapfile there and may refuse hibernation regardless of everything else being correct (<a href="https://github.com/systemd/systemd/issues/15354">systemd#15354</a>). Keeping the path as <code>/swap.img</code> also meant <code>/etc/fstab</code> needed no change at all, removing a whole class of risk.</p>
 
   <h3>Swapfile vs. swap partition</h3>
-  <p>A swap <em>partition</em> needs only <code>resume=UUID=…</code> — no offset, nothing that can drift. But this disk has zero unallocated bytes, so it would mean shrinking <code>/home</code> offline from a live USB with 563 GB of data on it. Not worth it.</p>
+  <p>A swap <em>partition</em> needs only <code>resume=UUID=…</code> — no offset, nothing that can drift. But this disk had zero unallocated bytes, so it would mean shrinking <code>/home</code> offline from a live USB with 563 GB of data on it. Not worth it.</p>
   <div class="note trap">
     <span class="tag">The swapfile's one real weakness</span>
     <p><code>resume_offset</code> is a physical block offset baked into the kernel cmdline. If the swapfile is ever recreated, resized, or restored from a backup, hibernate still <em>succeeds</em> and <strong>resume silently fails, losing the session.</strong></p>
-    <p>Re-run <code>setup-hibernate.sh</code> if you ever touch the swapfile.</p>
+  </div>
+  <div class="note why">
+    <span class="tag">This was the right call for four days</span>
+    <p>The migration is <a href="#partition">Part five</a>; the lost session that made the case for it is <a href="#postmortem">Part six</a>.</p>
+    <p>Worth noting what actually tipped the decision, because it was <em>not</em> the offset — the offset never drifted, and was verified correct at the moment of the failure. What mattered was <strong>fragmentation</strong>: the swapfile lived in 61 extents scattered across 92 GB of a 94 GB filesystem, which made the image write slow. A slow write is a wide window in which to lose power.</p>
   </div>
 
-  <h3>The procedure</h3>
+  <h3>The procedure <span class="sup">superseded by Part five</span></h3>
+  <p>Kept because the <em>shape</em> of it is the reusable lesson: build the replacement before destroying the original, so any failure leaves a bootable machine.</p>
 <pre><code># 1. Build the new swapfile BEFORE destroying the old one, so a failure
 #    anywhere leaves a bootable machine with working swap.
 dd if=/dev/zero of=/swap.img.new bs=1M count=32768 status=progress
@@ -693,6 +728,17 @@ HandleLidSwitchExternalPower=sleep</code></pre>
   <h3>Why a fixed 2 h delay</h3>
   <p>Left unset, systemd estimates from the battery discharge rate and hibernates only when the battery is nearly flat. More convenient, but it drains most of the pack first — exactly the outcome this whole exercise was meant to prevent. At 0.44 W, two hours costs ~1.6% before it goes to disk, whether you're away overnight or all weekend.</p>
   <p><code>HibernateOnACPower=no</code> because plugged in the battery isn't draining, so hibernating buys nothing and costs ~18 s of WiFi firmware reload on resume.</p>
+  <div class="note good">
+    <span class="tag">This is not "never hibernates on AC"</span>
+    <p>The man page is explicit: <em>"If this option is disabled, the countdown of <code>HibernateDelaySec=</code> starts only after AC power is disconnected, keeping the system in the suspend state otherwise."</em></p>
+    <p>So suspending while plugged in parks the machine in s2idle indefinitely, and <strong>pulling the charger starts the 2 h clock from that moment</strong>. The setting defers the countdown until it matters rather than cancelling it.</p>
+  </div>
+  <p>One caveat: systemd can only notice the unplug while it is briefly awake, and <code>SuspendEstimationSec</code> defaults to <strong>60 min</strong> — so detection lags by up to about an hour, making the worst case roughly <em>1 h + 2 h</em> from unplug to hibernate.</p>
+  <div class="note why">
+    <span class="tag">This interacts with Part one on purpose</span>
+    <p>The AC adapter (<code>ACAD</code>) is deliberately disarmed as a wake source — it was the original complaint — so an unplug event can no longer wake the machine to trigger an immediate re-evaluation.</p>
+    <p>The trade is a possibly-delayed countdown start in exchange for a laptop that doesn't wake in your bag. Clearly worth it.</p>
+  </div>
 
   <h3>Reliability</h3>
   <p><strong>6 cycles, 5 hibernated.</strong> The single failure was the very first cycle, before debug logging was enabled, and was never explained — same alarm, same <code>IRQ 9</code> wake, same power state, opposite outcome. Cycles 2–6 were consecutive clean successes.</p>
@@ -707,6 +753,19 @@ HandleLidSwitchExternalPower=sleep</code></pre>
     <span class="tag">The failure mode matters</span>
     <p>If the handoff doesn't happen, the machine <strong>wakes and stays awake</strong>. The lid is already shut so no new lid event arrives; the only backstop is GNOME's <code>sleep-inactive-battery-timeout</code> of 30 minutes. In a bag that is worse than plain suspend.</p>
   </div>
+  <h3>Verified end-to-end on the swap partition</h3>
+<pre><code>15:50:31  lid closed   → suspend
+17:50:31  Timekeeping suspended for 7198.836 seconds   ← 2 h, one unbroken segment
+17:50:31  Performing sleep operation 'hibernate'...
+18:22:17  Timekeeping suspended for 1897.523 seconds   ← 31.6 min at zero draw
+18:22:17  PM: hibernation: hibernation exit            ← same boot ID</code></pre>
+  <p><code>HibernateDelaySec=2h</code> honoured to within 1.2 s, and the whole cycle cost about 4% of the battery.</p>
+  <div class="note good">
+    <span class="tag">Note the single segment</span>
+    <p>On 2026-08-16 the same 2 h window was split into two ~3599 s halves, because systemd woke at the 1 h mark to sample the battery. It now has a <strong>learned discharge rate</strong> on file — 1 %/hour, matching the 0.79 %/hour measured in Part two — so it schedules one alarm for the whole delay instead of waking to re-measure.</p>
+    <p>Fewer wake/re-suspend cycles as the machine learns its own hardware.</p>
+  </div>
+  <p>Then, on 2026-08-17, a cycle failed in a completely different way. The handoff worked perfectly — it hibernated exactly as designed — and the <em>resume</em> lost the session. That one is <a href="#postmortem">Part six</a>, and it is the most useful thing on this page, because the method for diagnosing it generalises to every future hibernate failure.</p>
 
   <h3>Clamshell behaviour</h3>
   <p>With an external monitor attached the lid does nothing — by design, twice over:</p>
@@ -717,8 +776,155 @@ HandleLidSwitchExternalPower=sleep</code></pre>
   <p>That second one comes from <code>lid-close-suspend-with-external-monitor false</code>. GNOME only takes that inhibitor <em>when a monitor is present</em> — undocked, logind owns the lid.</p>
 </section>
 
+<section id="partition">
+  <h2 class="sec"><span class="part">06 — Part five</span>Migrating to a swap partition</h2>
+  <p><strong>2026-08-19.</strong> Retires <code>resume_offset</code> permanently and replaces 61 scattered extents with one contiguous span.</p>
+
+  <h3>The direction of the shrink is the whole game</h3>
+  <p><code>/home</code> ran to the end of the disk. That leaves two ways to free 64 GB, and they are <em>not</em> comparable:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Approach</th><th>What moves</th><th>Risk</th></tr></thead>
+    <tbody>
+      <tr><td>Trim <code>/home</code>'s <strong>right</strong> edge, swap in the freed tail</td><td>only data living in that last slice</td><td>Low — <code>/</code>, <code>/home</code>'s start, and every UUID untouched</td></tr>
+      <tr><td><strong>Grow <code>/</code></strong> instead</td><td><code>/home</code>'s start sector, so all ~508 GB relocates</td><td>Hours of I/O, and the one operation where a power cut destroys the filesystem</td></tr>
+    </tbody>
+  </table></div>
+  <p>Same live USB, wildly different exposure. Confirm afterwards that the start sector genuinely didn't move:</p>
+<pre><code>for p in 3 4 5; do
+  s=$(cat /sys/block/nvme0n1/nvme0n1p$p/start)
+  z=$(cat /sys/block/nvme0n1/nvme0n1p$p/size)
+  printf "p%s start=%-12s size=%-12s end=%s\n" "$p" "$s" "$z" "$((s+z-1))"
+done
+
+p3 start=4204544      size=200001536    end=204206079
+p4 start=204206080    size=1615104000   end=1819310079   ← start UNCHANGED
+p5 start=1819310080   size=134213632    end=1953523711   ← exactly p4's end + 1</code></pre>
+
+  <h3>Configuration</h3>
+<pre><code>sudo ./setup-hibernate.sh --partition /dev/nvme0n1p5</code></pre>
+  <p>The script's ordering is the part worth copying. It activates the <strong>new</strong> swap before disturbing the old, and leaves the old swapfile on disk as a fallback:</p>
+  <ol>
+    <li><code>mkswap</code> the partition — refuses whole disks, mounted devices, and anything backing <code>/</code>, <code>/home</code>, <code>/boot</code>, <code>/boot/efi</code></li>
+    <li><code>swapon</code> the new partition</li>
+    <li>rewrite <code>/etc/fstab</code> — new <code>UUID=</code> entry, old swap entries commented out, timestamped backup</li>
+    <li><code>swapoff /swap.img</code> but <strong>do not delete it</strong></li>
+    <li>strip <em>both</em> <code>resume=</code> and <code>resume_offset=</code>, write back <code>resume=UUID=…</code> with no offset, and abort if a stale offset survived the edit</li>
+    <li><code>update-initramfs</code>, then <code>update-grub</code></li>
+  </ol>
+
+  <h3>Then the dracut two-step, again</h3>
+  <p>Same trap as gotcha 1, and easy to skip because everything <em>looks</em> finished:</p>
+<pre><code>sudo reboot                        # 1. now /proc/cmdline finally has resume=
+sudo update-initramfs -u -k all    # 2. only now will dracut include the module
+sudo reboot                        # 3.</code></pre>
+
+  <h3>Verification</h3>
+<pre><code>cat /proc/cmdline | tr ' ' '\n' | grep resume   # → resume=UUID=…, and NO resume_offset
+cat /sys/power/resume                           # → 259:5  (major 259, minor 5 = nvme0n1p5)
+cat /sys/power/resume_offset                    # → 0      (correct for a partition)</code></pre>
+  <div class="note good">
+    <span class="tag">One check subsumes the rest</span>
+    <p><code>/sys/power/resume</code> is the check that matters, and it replaces the <code>lsinitrd</code> grep entirely. The kernel <em>cannot</em> resolve a filesystem <code>UUID=</code> by itself (gotcha 2), so a real device number there is proof the initramfs resume module is present and working.</p>
+    <p>If it reads <code>0:0</code>, step 2 of the two-step didn't take.</p>
+  </div>
+
+  <h3>Result</h3>
+<pre><code>PM: hibernation: Need to copy 3156089 pages   → 12.04 GiB, 18.8% of the partition
+ACPI: PM: Waking up from system sleep state S4  real S4, fully powered off
+PM: hibernation: Hibernation image restored successfully.
+efivarfs: removing variable HibernateLocation-…  pointer cleaned up</code></pre>
+  <p>Boot ID unchanged. <code>/</code> went from <strong>73% → 36% used</strong> once <code>/swap.img</code> was deleted, and resume was noticeably faster — partly the smaller image, but partly one contiguous read instead of 61 scattered ones. Only the second half of that is permanent.</p>
+</section>
+
+<section id="postmortem">
+  <h2 class="sec"><span class="part">07 — Part six</span>A lost session, diagnosed</h2>
+  <p>The failure that justified Part five, worked through in full — because the method matters more than this particular fault.</p>
+
+  <h3>Symptom</h3>
+  <p>"The machine was suspended a couple of nights ago. When I turned it on today it seemed like it just started, not resumed."</p>
+
+  <h3>Step 1 — did it resume, or cold-boot?</h3>
+  <p>This is the only question that matters first, and it has an exact answer. <strong>A successful resume keeps the same boot ID; a failed one starts a new boot.</strong></p>
+<pre><code>journalctl --list-boots
+
+-6  c38fad9e…  Sun 2026-08-16 11:16:51  →  Mon 2026-08-17 20:29:01
+-5  6fa9f292…  Wed 2026-08-19 13:37:10  →  Wed 2026-08-19 13:42:25</code></pre>
+  <p>New boot ID, and ~41 hours unaccounted for. It cold-booted.</p>
+
+  <h3>Step 2 — did it actually hibernate?</h3>
+  <p>Read the <em>tail</em> of the boot that ended:</p>
+<pre><code>journalctl -b -6 | tail -60
+
+Aug 17 18:29:00  Suspending, then hibernating...
+Aug 17 20:29:01  Timekeeping suspended for 6457.005 + 740.978 seconds   ← 2 h
+Aug 17 20:29:01  System returned from sleep operation 'suspend-then-hibernate'.
+Aug 17 20:29:01  Performing sleep operation 'hibernate'...
+Aug 17 20:29:01  PM: hibernation: hibernation entry</code></pre>
+  <p>suspend-then-hibernate did its job exactly. The journal ending there is <em>correct</em> for a machine powering off — and it also rules out a <strong>failed</strong> hibernate: had the image not fit, the kernel would have thawed and the machine would have stayed awake, logging it.</p>
+
+  <h3>Step 3 — what did the resume attempt say?</h3>
+<pre><code>journalctl -b -5 | grep -iE 'resume|hibernat'
+
+systemd-hibernate-resume-generator: Reported hibernation image:
+  ID=ubuntu VERSION_ID=26.04 kernel=7.0.0-29-generic UUID=9cb3dc28-… offset=20113408
+systemd-hibernate-resume: Unable to resume from device
+  '/dev/disk/by-uuid/9cb3dc28-…' (259:3) offset 20113408, continuing boot process.
+kernel: PM: Image not found (code -22)</code></pre>
+  <p><code>-22</code> is <code>-EINVAL</code>: the kernel went to the right place and found no valid swsusp signature there.</p>
+
+  <h3>Step 4 — rule things out</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Suspect</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>Stale <code>resume_offset</code></td><td><strong>No.</strong> The EFI <code>HibernateLocation</code> variable survived intact and pointed correctly.</td></tr>
+      <tr><td>Wrong offset all along</td><td><strong>No.</strong> The same swapfile at the same offset had resumed 11 h 44 min of hibernation the previous night, same boot ID.</td></tr>
+      <tr><td>The partition resize</td><td><strong>No.</strong> Boot -5 logged <code>nvme0n1: p1 p2 p3 p4</code> — <code>p5</code> did not exist yet. The resize happened at 14:04, <em>after</em> the failed resume at 13:37.</td></tr>
+      <tr><td>Image too large to fit</td><td><strong>No.</strong> That aborts and leaves the machine awake (Step 2).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Step 5 — the conclusion</h3>
+  <p>The image was written to a valid location but was <strong>invalid on read-back</strong>. That is diagnostic, because of how swsusp orders its writes:</p>
+  <div class="note trap">
+    <span class="tag">swsusp writes the signature last</span>
+    <p>The page data goes down first and the <strong>header signature last</strong>. So an image write that doesn't complete produces <em>exactly</em> <code>-22</code> — and produces it silently. The machine cold-boots and the session is simply gone, with no error surfaced to the user.</p>
+  </div>
+  <p>The machine had been on battery since ~17:34 the previous day — over a day of <code>ConditionACPower=true</code> jobs skipping — and was writing ~26 GB to this:</p>
+<pre><code>Adding 33554428k swap on /swap.img.  Priority:-1  extents:61 across:92004352k</code></pre>
+  <p><strong>61 extents scattered across 92 GB of a 94 GB filesystem</strong>, at the tail end of a very long battery run. Losing power partway through is the leading explanation and fits every piece of evidence.</p>
+  <div class="note why">
+    <span class="tag">Stated honestly: not proven</span>
+    <p>The competing explanation is that a good image was invalidated later in that 41-hour window — an aborted resume would do it, and would leave no journal trace.</p>
+    <p>Both explanations are addressed by the two fixes below, which is why it was not worth chasing further.</p>
+  </div>
+
+  <h3>Step 6 — the fixes</h3>
+  <p><strong>Faster write</strong> — Part five. One contiguous span instead of 61 extents directly shrinks the window in which losing power destroys the session.</p>
+  <p><strong>More reserve</strong> — the packaged UPower policy fires its emergency hibernate at <strong>2% battery</strong>, a very thin margin from which to write a multi-gigabyte image.</p>
+<pre><code># /etc/UPower/UPower.conf.d/10-hibernate-reserve.conf
+[UPower]
+PercentageCritical=10.0
+PercentageAction=7.0
+
+                    packaged   now
+PercentageLow           20.0   20.0   (unchanged)
+PercentageCritical       5.0   10.0
+PercentageAction         2.0    7.0   ← the emergency hibernate trigger</code></pre>
+  <p><code>PercentageCritical</code> had to move as well — UPower requires <code>Low &gt; Critical &gt; Action</code>, and an Action of 7.0 under a Critical of 5.0 would have inverted them.</p>
+  <div class="note trap">
+    <span class="tag">The filename is validated silently</span>
+    <p>UPower 1.91.1 supports drop-ins, but the filename must match <code>^[0-9][0-9]-[a-zA-Z0-9_-]*\.conf$</code>. A file that doesn't match is ignored <em>without complaint</em>.</p>
+    <p>The thresholds are also not exposed on D-Bus, so a clean restart plus <code>GetCriticalAction</code> is the whole of the available verification.</p>
+  </div>
+<pre><code>systemctl restart upower
+journalctl -u upower --since -5min          # any parse error shows here
+busctl call org.freedesktop.UPower /org/freedesktop/UPower \
+    org.freedesktop.UPower GetCriticalAction    # → s "HybridSleep"</code></pre>
+  <p>That return value is worth reading: with <code>AllowRiskyCriticalPowerAction=false</code>, UPower falls back to a different action when it can't hibernate, so <code>HybridSleep</code> coming back confirms it still sees hibernation as available. It's left at <code>HybridSleep</code> deliberately — it writes the image <em>and</em> stays in s2idle, so plugging in resumes instantly while the disk image covers the battery actually dying.</p>
+</section>
+
 <section id="files">
-  <h2 class="sec"><span class="part">06 — Reference</span>Installed files</h2>
+  <h2 class="sec"><span class="part">08 — Reference</span>Installed files</h2>
   <div class="tw"><table>
     <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
     <tbody>
@@ -728,20 +934,25 @@ HandleLidSwitchExternalPower=sleep</code></pre>
       <tr><td><code>/etc/polkit-1/rules.d/10-enable-hibernate.rules</code></td><td>Overrides Ubuntu's blanket hibernate denial (local + active only).</td></tr>
       <tr><td><code>/etc/systemd/sleep.conf.d/10-hibernate-delay.conf</code></td><td><code>HibernateDelaySec=2h</code>, <code>HibernateOnACPower=no</code></td></tr>
       <tr><td><code>/etc/systemd/logind.conf.d/10-lid-sleep.conf</code></td><td><code>HandleLidSwitch=sleep</code> (+ external power)</td></tr>
+      <tr><td><code>/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf</code></td><td>Raises the emergency-hibernate battery floor from 2% to 7% — see <a href="#postmortem">Part six</a>.</td></tr>
       <tr><td><code>~/.local/bin/suspend-report</code></td><td>Health report on the last suspend cycle.</td></tr>
-      <tr><td><code>/etc/default/grub</code></td><td><code>resume=UUID=… resume_offset=20113408</code> appended; timestamped <code>.bak</code> alongside.</td></tr>
+      <tr><td><code>/etc/default/grub</code></td><td><code>resume=UUID=…</code> appended — <strong>no <code>resume_offset</code></strong>; timestamped <code>.bak</code> alongside.</td></tr>
+      <tr><td><code>/etc/fstab</code></td><td>Swap entry now <code>UUID=</code> of <code>p5</code>; the old <code>/swap.img</code> line commented out, timestamped <code>.bak</code> alongside.</td></tr>
     </tbody>
   </table></div>
 <pre><code>armed wake sources:  PNP0C0D (lid), PNP0C0C (power button),
                      pnp0/00:00 + rtc0/alarmtimer
-/sys/power/resume         = 259:3
-/sys/power/resume_offset  = 20113408
-swap                      = 32 G at /swap.img
+/sys/power/resume         = 259:5          (nvme0n1p5)
+/sys/power/resume_offset  = 0              (correct for a partition)
+swap                      = 64 G at /dev/nvme0n1p5, contiguous
+/                         = 36% used, 57 G free
+UPower PercentageAction   = 7.0            (packaged default 2.0)
 CanSuspend / CanHibernate / CanSuspendThenHibernate = yes / yes / yes</code></pre>
+  <p><code>/swap.img</code> is <strong>gone</strong> — deleted only after a resume from the partition was confirmed working.</p>
 </section>
 
 <section id="cookbook">
-  <h2 class="sec"><span class="part">07 — Reference</span>Diagnostic cookbook</h2>
+  <h2 class="sec"><span class="part">09 — Reference</span>Diagnostic cookbook</h2>
 
   <h4>Health report on the last suspend cycle</h4>
 <pre><code>suspend-report</code></pre>
@@ -777,9 +988,20 @@ cat /sys/power/suspend_stats/{success,fail}</code></pre>
 <pre><code>echo "cycles:     $(journalctl -b -u systemd-suspend-then-hibernate | grep -c 'Starting systemd-suspend')"
 echo "hibernated: $(journalctl -b -u systemd-suspend-then-hibernate | grep -c "operation 'hibernate'")"</code></pre>
 
-  <h4>Confirm the swapfile offset still matches the cmdline</h4>
-<pre><code>grep -o 'resume_offset=[0-9]*' /proc/cmdline
-sudo filefrag -b4096 -v /swap.img | head -4</code></pre>
+  <h4>Did the last hibernate actually resume?</h4>
+<pre><code>journalctl --list-boots | tail -3
+#   Same boot ID  = it resumed.
+#   New boot ID   = it did not, and the session is gone.</code></pre>
+
+  <h4>…and if it didn't, why</h4>
+<pre><code>journalctl -b -1 | tail -60 | grep -iE 'hibernat|sleep operation'   # did it hibernate?
+journalctl -b  0 | grep -iE 'resume|Image not found'                # what resume said
+#   -22 = image written but INVALID on read-back, not mislocated.</code></pre>
+
+  <h4>Confirm the resume device is resolved</h4>
+<pre><code>cat /sys/power/resume                          # 259:5 = nvme0n1p5; 0:0 = initramfs module missing
+cat /proc/cmdline | tr ' ' '\n' | grep resume  # expect NO resume_offset
+journalctl -b | grep 'Adding .* swap on'       # a partition reports no extent count at all</code></pre>
 
   <h4>Who is blocking sleep or the lid</h4>
 <pre><code>systemd-inhibit --list
@@ -788,22 +1010,26 @@ systemd-analyze cat-config systemd/logind.conf</code></pre>
 </section>
 
 <section id="gotchas">
-  <h2 class="sec"><span class="part">08 — Reference</span>Gotchas worth remembering</h2>
+  <h2 class="sec"><span class="part">10 — Reference</span>Gotchas worth remembering</h2>
   <ol class="gotchas">
     <li><p><b>update-initramfs here is a dracut shim</b>, not initramfs-tools — <code>dpkg -S /usr/sbin/update-initramfs</code> proves it. So <code>/etc/initramfs-tools/conf.d/resume</code> is <strong>inert</strong>. Worse, dracut's <code>74resume</code> <code>check()</code> <em>excludes</em> the resume module unless <code>/proc/cmdline</code> already contains <code>resume=</code> — so the initramfs must be rebuilt <strong>after</strong> the GRUB change and a reboot. Verify with <code>sudo lsinitrd /boot/initrd.img-$(uname -r) | grep -i hibernate-resume</code>.</p></li>
-    <li><p><b>The kernel cannot resolve a filesystem UUID= for resume</b> — only <code>PARTUUID=</code> or a device path. <code>resume=UUID=…</code> depends entirely on the initramfs resolving it, so <code>/sys/power/resume</code> reading <code>0:0</code> after boot means the resolver is missing. Working value here is <code>259:3</code>.</p></li>
+    <li><p><b>The kernel cannot resolve a filesystem UUID= for resume</b> — only <code>PARTUUID=</code> or a device path. <code>resume=UUID=…</code> depends entirely on the initramfs resolving it, so <code>/sys/power/resume</code> reading <code>0:0</code> after boot means the resolver is missing. Working value here is <code>259:5</code> (<code>259:3</code> before the Part five migration).</p></li>
     <li><p><b>ProtectHome=yes on logind rules out /home</b> for the swapfile, no matter how much space is there.</p></li>
     <li><p><b>Ubuntu disables hibernation via polkit</b>, and <code>CanHibernate="no"</code> means <em>policy denied</em>, not <em>unsupported</em> — that's <code>"na"</code>.</p></li>
     <li><p><b>HoldoffTimeoutSec=30s</b> — logind ignores lid events for 30 s after any resume so connectors can be re-detected. A lid test done too soon looks like a failure and isn't. Also true in daily use: wake, shut the lid within 30 s, and it won't sleep.</p></li>
     <li><p><b>Closing the lid while already suspended does fire an SCI</b>, but the s2idle loop filters it and returns to s0i3. Verified: one continuous suspend, two <code>Timekeeping suspended</code> segments totalling 99.2% residency, and only <em>one</em> <code>PM: suspend exit</code>.</p></li>
     <li><p><b>Kernel PM messages are timestamped at resume</b>, not when they happened — the console is suspended and the ring buffer flushes on wake. So <code>Suspending console(s)</code> legitimately appears <em>after</em> <code>Lid opened</code>.</p></li>
     <li><p><b>MT7922 WiFi fails pci_pm_restore (-110) on hibernate resume</b> and does a full firmware reload instead. Not a fault — but WiFi takes <strong>~18 s</strong> to come back, versus ~3 s from s2idle. Worth knowing before walking into a lecture.</p></li>
-    <li><p><b>filefrag reports in filesystem blocks</b> (4096 B here), matching the page size, so the value is directly usable as <code>resume_offset</code>. Confirmed independently — systemd computed the same <code>offset: 20113408</code> via its own FIEMAP call when writing the EFI <code>HibernateLocation</code> variable.</p></li>
+    <li><p><b>filefrag reports in filesystem blocks</b> (4096 B here), matching the page size, so the value is directly usable as <code>resume_offset</code>. Confirmed independently — systemd computed the same <code>offset: 20113408</code> via its own FIEMAP call when writing the EFI <code>HibernateLocation</code> variable. <em>(Swapfile-era only — a partition has no offset.)</em></p></li>
+    <li><p><b>swsusp writes the page data first and the header signature LAST.</b> So an interrupted image write fails as <code>PM: Image not found (code -22)</code> on the next boot — the same error a wrong offset gives, which makes it easy to misdiagnose. <code>-22</code> means <em>no valid signature at that location</em>, not <em>wrong location</em>. Check the EFI pointer before blaming the offset.</p></li>
+    <li><p><b>A failed resume is silent.</b> No dialog, no notification — the machine just cold-boots and the session is gone. <code>journalctl --list-boots</code> is the only routine way to notice, since a <strong>new boot ID</strong> after a hibernate is the tell.</p></li>
+    <li><p><b>A failed hibernate and a failed resume look nothing alike.</b> A hibernate that can't proceed thaws and leaves the machine <strong>awake</strong>, logging why. If the machine powered off, hibernation ran — any fault is on the resume side.</p></li>
+    <li><p><b>UPower drop-in filenames are validated</b> against <code>^[0-9][0-9]-[a-zA-Z0-9_-]*\.conf$</code>, and a file that doesn't match is ignored without complaint. The thresholds are also not exposed on D-Bus, so verification is limited to a clean restart plus <code>GetCriticalAction</code>.</p></li>
   </ol>
 </section>
 
 <section id="trouble">
-  <h2 class="sec"><span class="part">09 — Reference</span>Troubleshooting</h2>
+  <h2 class="sec"><span class="part">11 — Reference</span>Troubleshooting</h2>
 
   <h3>Machine wakes on its own again</h3>
 <pre><code>journalctl -b | grep "Triggering wakeup"   # any IRQ other than 9 = a leaked source
@@ -814,8 +1040,15 @@ sudo /usr/local/sbin/framework-wakeup-policy   # re-apply by hand</code></pre>
 <pre><code>suspend-report        # residency below 95% means s0i3 isn't being reached
 journalctl -b | grep "deepest state"</code></pre>
 
-  <h3>Hibernate stopped working after touching the swapfile</h3>
-  <p>Re-run <code>setup-hibernate.sh</code>. The physical offset changed. Symptom: hibernate succeeds, then the machine boots fresh and the session is gone.</p>
+  <h3>The machine "just started" instead of resuming — session lost</h3>
+  <p>Work it in this order; the full worked example is <a href="#postmortem">Part six</a>.</p>
+<pre><code>journalctl --list-boots | tail -3   # new boot ID after a hibernate = resume failed
+journalctl -b -1 | tail -60         # did it hibernate? look for 'hibernation entry'
+journalctl -b  0 | grep -iE 'resume|Image not found'</code></pre>
+  <p><code>PM: Image not found (code -22)</code> means the image was <strong>invalid</strong>, not mislocated — check whether the EFI pointer was intact before suspecting the resume device. If the machine had been on battery a long time, suspect an incomplete write and confirm the reserve is still in place with <code>grep -r Percentage /etc/UPower/UPower.conf.d/</code>.</p>
+
+  <h3>Hibernate stopped working after touching swap</h3>
+  <p>Re-run <code>setup-hibernate.sh</code>. On the current partition setup there is no offset to drift, so this should only matter if the partition is recreated and the UUID changes. In the swapfile era it was the standing hazard: hibernate succeeded, then the machine booted fresh and the session was gone.</p>
 
   <h3>suspend-then-hibernate wakes but stays awake</h3>
 <pre><code>sudo mkdir -p /etc/systemd/system/systemd-suspend-then-hibernate.service.d
@@ -835,7 +1068,7 @@ journalctl -b -u systemd-suspend-then-hibernate | grep -E "Starting|Attempting|P
 </section>
 
 <section id="undo">
-  <h2 class="sec"><span class="part">10 — Reference</span>How to undo everything</h2>
+  <h2 class="sec"><span class="part">12 — Reference</span>How to undo everything</h2>
 
   <h4>Wake-source policy</h4>
 <pre><code>sudo systemctl disable --now framework-wakeup-policy.service
@@ -852,7 +1085,10 @@ sudo systemctl restart systemd-logind   # or just reboot</code></pre>
 
   <h4>Hibernation entirely</h4>
 <pre><code>sudo rm /etc/polkit-1/rules.d/10-enable-hibernate.rules
+sudo rm -f /etc/UPower/UPower.conf.d/10-hibernate-reserve.conf
+sudo systemctl restart upower
 sudo cp /etc/default/grub.bak.&lt;timestamp&gt; /etc/default/grub
+sudo cp /etc/fstab.bak.&lt;timestamp&gt; /etc/fstab
 sudo rm -f /etc/initramfs-tools/conf.d/resume
 sudo update-initramfs -u -k all &amp;&amp; sudo update-grub
 # optionally shrink /swap.img back to 8 GB and re-run mkswap</code></pre>
@@ -869,7 +1105,9 @@ sudo update-initramfs -u -k all &amp;&amp; sudo update-grub
 </main>
 
 <footer>
-  tinkertoy · Framework 13 AMD 7840U · Ubuntu 26.04 · sources in ~/Documents/framework13-suspend-scripts/
+  tinkertoy · Framework 13 AMD 7840U · Ubuntu 26.04 · last updated 2026-08-19<br>
+  sources in ~/school_lab/git_repositories/framework13-suspend_hibernate/<br>
+  Manual <code>systemctl hibernate</code> and a full 2 h lid-closed suspend-then-hibernate cycle are both verified on the swap partition.
 </footer>
 
 </div>

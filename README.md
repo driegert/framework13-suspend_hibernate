@@ -110,6 +110,7 @@ nodes). If it reports 20-something today, this repo is for you.
 | `10-enable-hibernate.rules` | `/etc/polkit-1/rules.d/` (0644) | ⚠️ Ubuntu-specific |
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) | ✅ tune to taste |
 | `10-lid-sleep.conf` | `/etc/systemd/logind.conf.d/` (0644) | ✅ tune to taste |
+| `10-hibernate-reserve.conf` | `/etc/UPower/UPower.conf.d/` (0644) | ✅ as-is |
 | `suspend-report` | `~/.local/bin/` (0755) | ⚠️ edit battery model |
 
 All of it lives in [`framework13-suspend-scripts/`](framework13-suspend-scripts/).

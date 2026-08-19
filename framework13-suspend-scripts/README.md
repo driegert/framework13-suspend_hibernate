@@ -17,13 +17,15 @@ without root — diff them if you want to be sure).
 | `10-enable-hibernate.rules` | `/etc/polkit-1/rules.d/` (0644) |
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) |
 | `10-lid-sleep.conf` | `/etc/systemd/logind.conf.d/` (0644) |
+| `10-hibernate-reserve.conf` | `/etc/UPower/UPower.conf.d/` (0644) |
 | `suspend-report` | `~/.local/bin/` (0755) |
 | `setup-hibernate.sh` | run once with sudo; not installed |
 
 ## Reinstall from scratch
 
 ```sh
-D=~/Documents/framework13-suspend-scripts
+cd framework13-suspend-scripts     # from the repo root
+D=$PWD
 
 # 1. wake-source policy
 sudo install -m 0755 "$D/framework-wakeup-policy"          /usr/local/sbin/framework-wakeup-policy
@@ -44,7 +46,12 @@ sudo install -D -m 0644 "$D/10-hibernate-delay.conf" /etc/systemd/sleep.conf.d/1
 sudo install -D -m 0644 "$D/10-lid-sleep.conf"       /etc/systemd/logind.conf.d/10-lid-sleep.conf
 sudo reboot
 
-# 5. health check
+# 5. raise the emergency-hibernate battery floor from 2% to 7%
+#    (filename must match ^[0-9][0-9]-[a-zA-Z0-9_-]*\.conf$ or it is silently ignored)
+sudo install -D -m 0644 "$D/10-hibernate-reserve.conf" /etc/UPower/UPower.conf.d/10-hibernate-reserve.conf
+sudo systemctl restart upower
+
+# 6. health check
 install -m 0755 "$D/suspend-report" ~/.local/bin/suspend-report
 suspend-report
 ```
@@ -54,3 +61,10 @@ suspend-report
 **Re-run `setup-hibernate.sh` if `/swap.img` is ever recreated, resized, or
 restored from a backup.** The physical offset changes; a stale `resume_offset`
 means hibernate succeeds and resume silently fails, losing the session.
+
+This applies to **swapfile mode only** — `--partition` has no offset, which is
+the main reason to prefer it. Note that a *stale offset* is not the only way to
+get a silently lost session: an image write that doesn't complete leaves the
+same `PM: Image not found (code -22)` on the next boot, because swsusp writes
+the header signature last. See "A lost session, diagnosed" in
+`../framework13-suspend-hibernate.md`.
