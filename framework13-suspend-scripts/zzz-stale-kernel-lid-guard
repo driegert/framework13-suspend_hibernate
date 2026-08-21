@@ -1,0 +1,16 @@
+#!/bin/sh
+# Re-evaluate the stale-kernel lid guard whenever a kernel is installed.
+#
+# Named zzz- so it sorts after zz-update-grub: by then the boot menu reflects
+# the new kernel, so "newest installed" and "what GRUB will boot" agree.
+#
+# dpkg passes $1=version $2=image-path; we ignore both and evaluate global
+# state, so this stays correct however it was invoked.
+#
+# Never fail a kernel install over this -- a broken guard must not leave dpkg
+# half-configured.
+set -e
+
+[ -x /usr/local/sbin/stale-kernel-lid-guard ] || exit 0
+/usr/local/sbin/stale-kernel-lid-guard || true
+exit 0

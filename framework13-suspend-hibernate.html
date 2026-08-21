@@ -389,11 +389,11 @@
 <header class="mast">
   <p class="eyebrow">Framework 13 · AMD Ryzen 7840U · Ubuntu 26.04</p>
   <h1>Tinkertoy Sleep Runbook</h1>
-  <p class="standfirst">Why this laptop wouldn't stay asleep, what was actually wrong, and the undocumented traps between a working <code>systemctl hibernate</code> and a machine you can shut and put in a bag — including one session that was lost anyway, and what its logs gave up.</p>
+  <p class="standfirst">Why this laptop wouldn't stay asleep, what was actually wrong, and the undocumented traps between a working <code>systemctl hibernate</code> and a machine you can shut and put in a bag — including two sessions that were lost anyway — for different reasons — and what their logs gave up.</p>
   <div class="mast-meta">
-    <span>kernel 7.0.0-29-generic</span>
+    <span>kernel 7.0.0-30-generic</span>
     <span>systemd 259</span>
-    <span>investigated 2026-08-12 → 08-19</span>
+    <span>investigated 2026-08-12 → 08-21</span>
   </div>
 </header>
 
@@ -408,11 +408,12 @@
     <li><a href="#sth"><span class="num">05</span>Suspend-then-hibernate</a></li>
     <li><a href="#partition"><span class="num">06</span>Swap partition</a></li>
     <li><a href="#postmortem"><span class="num">07</span>A lost session</a></li>
-    <li><a href="#files"><span class="num">08</span>Installed files</a></li>
-    <li><a href="#cookbook"><span class="num">09</span>Diagnostics</a></li>
-    <li><a href="#gotchas"><span class="num">10</span>Gotchas</a></li>
-    <li><a href="#trouble"><span class="num">11</span>Troubleshooting</a></li>
-    <li><a href="#undo"><span class="num">12</span>Undo</a></li>
+    <li><a href="#kerneltrap"><span class="num">08</span>Kernel-upgrade trap</a></li>
+    <li><a href="#files"><span class="num">09</span>Installed files</a></li>
+    <li><a href="#cookbook"><span class="num">10</span>Diagnostics</a></li>
+    <li><a href="#gotchas"><span class="num">11</span>Gotchas</a></li>
+    <li><a href="#trouble"><span class="num">12</span>Troubleshooting</a></li>
+    <li><a href="#undo"><span class="num">13</span>Undo</a></li>
   </ol>
 </nav>
 
@@ -457,6 +458,16 @@
       <div class="was">2% battery</div>
       <div class="now">7%</div>
     </div>
+    <div class="metric">
+      <div class="lbl">Hibernating on a stale kernel</div>
+      <div class="was">lost the session + 72% battery</div>
+      <div class="now">guarded</div>
+    </div>
+    <div class="metric">
+      <div class="lbl">WiFi back after resume</div>
+      <div class="was">~18 s (MT7922)</div>
+      <div class="now">~4 s (AX210)</div>
+    </div>
   </div>
 
   <h3>Sleep path now</h3>
@@ -489,13 +500,14 @@
     <li><strong>Lid closed with an external monitor → stays awake.</strong> Clamshell mode, intended.</li>
     <li><strong>On AC it suspends and stays suspended</strong> — but unplug it and the 2 h countdown starts from that moment.</li>
     <li><strong>Unplugging the charger no longer wakes it</strong> — the complaint that started all this.</li>
+    <li><strong>A kernel installed but not yet booted → the lid plain-suspends</strong> instead of hibernating, until you reboot.</li>
   </ul>
 </section>
 
 <section id="context">
   <h2 class="sec"><span class="part">01 — Context</span>The machine</h2>
 <pre><code>Framework 13, AMD Ryzen 7 7840U
-Ubuntu 26.04 LTS · kernel 7.0.0-29-generic · systemd 259 · GNOME/Wayland
+Ubuntu 26.04 LTS · kernel 7.0.0-30-generic · systemd 259 · GNOME/Wayland
 BIOS 03.20 (all firmware current per fwupdmgr)
 Secure Boot: disabled          kernel lockdown: [none]
 RAM: 59.4 GiB                  page size: 4096
@@ -666,7 +678,7 @@ filefrag -b4096 -v /swap.img | awk '/^[[:space:]]*0:/{print $4; exit}' | tr -cd 
 # -> 20113408
 
 # 4. Kernel cmdline, then rebuild
-#    GRUB_CMDLINE_LINUX_DEFAULT="quiet splash resume=UUID=<root> resume_offset=20113408"
+#    GRUB_CMDLINE_LINUX_DEFAULT="quiet splash resume=UUID=&lt;your-root-uuid&gt; resume_offset=20113408"
 update-initramfs -u -k all
 update-grub</code></pre>
   <p><code>dd</code> rather than <code>fallocate</code>: a fully written file has no unwritten extents, so the offset is unambiguous. Fragmentation is fine — a 4 MB file already has 2 extents and the 32 GB one has <strong>61</strong>. <code>resume_offset</code> only locates the swap header; swsusp chains the rest.</p>
@@ -923,8 +935,113 @@ busctl call org.freedesktop.UPower /org/freedesktop/UPower \
   <p>That return value is worth reading: with <code>AllowRiskyCriticalPowerAction=false</code>, UPower falls back to a different action when it can't hibernate, so <code>HybridSleep</code> coming back confirms it still sees hibernation as available. It's left at <code>HybridSleep</code> deliberately — it writes the image <em>and</em> stays in s2idle, so plugging in resumes instantly while the disk image covers the battery actually dying.</p>
 </section>
 
+<section id="kerneltrap">
+  <h2 class="sec"><span class="part">08 — Part seven</span>The kernel-upgrade trap</h2>
+  <p>A second lost session four days after Part six — same <code>-22</code>, entirely different cause. Left at ~93% with the lid shut, found the next evening at 22%, cold-booted, session gone.</p>
+  <p>The first suspect was the WiFi card, swapped that afternoon. Wrong suspect, and one line of log settles it.</p>
+
+  <h3>The timeline</h3>
+<pre><code>Aug 19 18:22:17  hibernation exit          ← a 2 h cycle that worked perfectly
+Aug 19 18:25:16  apt upgrade starts        (Requested-By: dave)
+Aug 19 18:26:14  linux-image-generic-hwe-26.04  7.0.0-29 → 7.0.0-30
+Aug 19 18:33:12  Lid closed.               ← still running 7.0.0-29
+Aug 19 20:33:14  Timekeeping suspended for 7199.006 seconds
+Aug 19 20:33:15  Performing sleep operation 'hibernate'...
+Aug 19 20:33:15  PM: hibernation: hibernation entry     ← last log, ever
+Aug 20 18:16:15  cold boot, GRUB picks 7.0.0-30, RTC reset to 2023-01-01
+Aug 20 18:16:03  PM: Image not found (code -22)</code></pre>
+  <p>The upgrade <strong>finished</strong> seven minutes before the lid closed. Nothing was mid-flight. The trap is subtler than "don't touch a laptop during an update":</p>
+  <div class="note trap">
+    <span class="tag">Installing a kernel and booting it are separate events</span>
+    <p>A hibernation image is stamped with the kernel that wrote it (<code>uts_release</code>), and no other kernel will restore it. <code>GRUB_DEFAULT=0</code> boots the <em>newest installed</em> kernel unconditionally. So from the moment apt lands a kernel until you reboot, <strong>every hibernation is a one-way trip</strong> — and nothing surfaces that state at lid-close time.</p>
+  </div>
+
+  <h3>Two independent failures</h3>
+  <p>Either one alone would have cost the session.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Failure</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><strong>The hibernate never completed</strong></td><td><code>-22</code> is <code>-EINVAL</code> from <code>swsusp_check()</code> — no <code>S1SUSPEND</code> signature on the partition. The signature is written <em>last</em>, so its absence means the write did not finish. The battery proves it never powered off.</td></tr>
+      <tr><td><strong>The image would have been rejected anyway</strong></td><td>The EFI pointer records <code>kernel=7.0.0-29-generic</code>; the machine came up on <code>7.0.0-30</code>. swsusp compares <code>uts_release</code> and refuses a mismatch.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note why">
+    <span class="tag">The two produce different errors</span>
+    <p>A kernel mismatch on a <em>valid</em> image gives <code>PM: Image mismatch</code>, not <code>Image not found</code>. Seeing <code>-22</code> means the write failed first — the mismatch never got a chance to fire.</p>
+  </div>
+
+  <h3>The battery arithmetic</h3>
+  <p>This is what separated "hibernated" from "hung pretending to". At <code>energy-full = 53.85 Wh</code>, 1% = 0.538 Wh:</p>
+  <div class="tw"><table>
+    <thead><tr><th>State</th><th>Draw</th><th>Per hour</th><th>Per day</th></tr></thead>
+    <tbody>
+      <tr><td>Hibernated / off</td><td>~0 W</td><td>0%</td><td>0%</td></tr>
+      <tr><td>Correct s2idle (s0i3)</td><td>0.44 W</td><td>0.8%</td><td>~20%</td></tr>
+      <tr><td><strong>What actually happened</strong></td><td><strong>1.74 W</strong></td><td><strong>3.2%</strong></td><td><strong>~78%</strong></td></tr>
+      <tr><td>Awake, idle</td><td>~6 W</td><td>11%</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+<pre><code> 93%  Aug 19 18:30:28   last sample before the lid closed
+  −0.4%   ~3 min awake
+  −1.6%   2 h of real s2idle @ 0.44 W      ← this part worked correctly
+ −70.2%   21.7 h hung @ 1.74 W             ← the entire loss
+ ────
+ 21%  Aug 20 18:16:59   first sample after the cold boot</code></pre>
+  <p>1.74 W is unremarkable — 4× a correct suspend, a quarter of an idle awake machine. Invisible over an evening, fatal over a day: from full it flattens the battery in <strong>31 hours</strong>.</p>
+  <div class="note good">
+    <span class="tag">The diagnostic in one sentence</span>
+    <p><strong>Hibernation draws 0 W because the machine is off. Any measurable drain across a hibernation means it never got there.</strong></p>
+  </div>
+
+  <h3>The WiFi card was not involved</h3>
+<pre><code>Aug 19 14:35:28  iwlwifi 0000:01:00.0: Detected Intel(R) Wi-Fi 6E AX210 160MHz</code></pre>
+  <p>The AX210 was already installed at the <em>start</em> of the boot that then ran suspend-then-hibernate three times flawlessly, including a full 2 h cycle resuming at 18:22. A component present during the successes cannot explain the failure. It did <em>improve</em> things: the old MT7922 needed ~18 s to bring WiFi back after a hibernate resume, the AX210 needs ~4 s.</p>
+
+  <h3>The fix — a stale-kernel lid guard</h3>
+  <p>The rule to enforce: <strong>while the running kernel is not the newest installed one, a lid close must not escalate to hibernation.</strong></p>
+  <p><code>stale-kernel-lid-guard</code> compares <code>uname -r</code> against the newest installed kernel. If they differ it writes a logind override and reloads:</p>
+<pre><code># /run/systemd/logind.conf.d/99-stale-kernel.conf
+[Login]
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend</code></pre>
+  <p>Plain suspend is resumed from RAM by the kernel already running — no image, no disk, no version check, nothing to reject.</p>
+  <div class="note good">
+    <span class="tag">Rebooting is both the fix and the reset</span>
+    <p>The override lives in <code>/run</code>, which is tmpfs. It evaporates at the next boot — precisely the event that resolves the condition. There is no state file, no flag that can stick armed, and no cleanup path to get wrong.</p>
+  </div>
+  <p>Precedence works because <strong>systemd orders drop-ins by filename across all search directories</strong>: a <code>99-</code> file in <code>/run</code> beats a <code>10-</code> file in <code>/etc</code>, despite <code>/etc</code> being the higher-priority directory.</p>
+  <p>Two triggers, because there are two ways onto a stale kernel:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Trigger</th><th>Covers</th></tr></thead>
+    <tbody>
+      <tr><td><code>/etc/kernel/postinst.d/zzz-stale-kernel-lid-guard</code></td><td>apt installs a kernel and you don't reboot — the case that caused this</td></tr>
+      <tr><td><code>stale-kernel-lid-guard.service</code> (boot)</td><td>you deliberately pick an older kernel from the GRUB menu</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>What it deliberately does not cover</h3>
+  <p>An explicit <code>systemctl hibernate</code>, and UPower's <code>CriticalPowerAction</code> (<code>HybridSleep</code> here) if the battery runs flat while suspended.</p>
+  <div class="note why">
+    <span class="tag">Why that is not worth "fixing"</span>
+    <p>With a stale kernel there is <strong>no configuration that survives a dead battery</strong> — the only restorable image is one written by the kernel you are not running. Masking hibernation would swap one lost session for an identical one, and would forfeit the case where you plug in before it dies.</p>
+    <p>Plain suspend at 0.44 W gives roughly <strong>five days</strong> from full. That is the window you have to reboot in.</p>
+  </div>
+
+  <h3>Verifying it</h3>
+  <p>The guard fires only during rare events, so it ships with a self-test that proves the mechanism end to end rather than asserting it:</p>
+<pre><code>sudo stale-kernel-lid-guard --self-test
+
+  baseline      HandleLidSwitch=sleep
+  guard armed   HandleLidSwitch=suspend
+  guard cleared HandleLidSwitch=sleep
+  PASS: sleep → suspend → sleep. The guard works.</code></pre>
+  <p>It reads the <em>effective</em> value back from logind over D-Bus rather than trusting the file it just wrote, and restores whatever the real evaluation calls for afterwards.</p>
+<pre><code>stale-kernel-lid-guard --status     # verdict + armed state, warns if they disagree</code></pre>
+  <p><code>--status</code> reports the <strong>verdict</strong> as well as the file state on purpose: a bare file check would report "not armed" on a stale kernel, which is true and useless. A disagreement between the two means the boot unit or the kernel hook did not run.</p>
+</section>
+
 <section id="files">
-  <h2 class="sec"><span class="part">08 — Reference</span>Installed files</h2>
+  <h2 class="sec"><span class="part">09 — Reference</span>Installed files</h2>
   <div class="tw"><table>
     <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
     <tbody>
@@ -933,6 +1050,10 @@ busctl call org.freedesktop.UPower /org/freedesktop/UPower \
       <tr><td><code>/etc/systemd/system-sleep/framework-wakeup-policy</code></td><td><strong>Re-applies before every sleep</strong> — the important one. <code>timeout 15</code> guarded, since systemd waits on sleep hooks.</td></tr>
       <tr><td><code>/etc/polkit-1/rules.d/10-enable-hibernate.rules</code></td><td>Overrides Ubuntu's blanket hibernate denial (local + active only).</td></tr>
       <tr><td><code>/etc/systemd/sleep.conf.d/10-hibernate-delay.conf</code></td><td><code>HibernateDelaySec=2h</code>, <code>HibernateOnACPower=no</code></td></tr>
+      <tr><td><code>/usr/local/sbin/stale-kernel-lid-guard</code></td><td>Forces plain suspend on a lid close while the running kernel isn't the newest installed. <code>--status</code>, <code>--self-test</code>.</td></tr>
+      <tr><td><code>/etc/systemd/system/stale-kernel-lid-guard.service</code></td><td>Evaluates the guard at boot — catches booting an old kernel from the GRUB menu</td></tr>
+      <tr><td><code>/etc/kernel/postinst.d/zzz-stale-kernel-lid-guard</code></td><td>Evaluates the guard whenever apt installs a kernel. <code>zzz-</code> sorts after <code>zz-update-grub</code>.</td></tr>
+      <tr><td><code>/run/systemd/logind.conf.d/99-stale-kernel.conf</code></td><td><strong>Written at runtime, tmpfs, not installed.</strong> Present only while the guard is armed.</td></tr>
       <tr><td><code>/etc/systemd/logind.conf.d/10-lid-sleep.conf</code></td><td><code>HandleLidSwitch=sleep</code> (+ external power)</td></tr>
       <tr><td><code>/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf</code></td><td>Raises the emergency-hibernate battery floor from 2% to 7% — see <a href="#postmortem">Part six</a>.</td></tr>
       <tr><td><code>~/.local/bin/suspend-report</code></td><td>Health report on the last suspend cycle.</td></tr>
@@ -952,7 +1073,7 @@ CanSuspend / CanHibernate / CanSuspendThenHibernate = yes / yes / yes</code></pr
 </section>
 
 <section id="cookbook">
-  <h2 class="sec"><span class="part">09 — Reference</span>Diagnostic cookbook</h2>
+  <h2 class="sec"><span class="part">10 — Reference</span>Diagnostic cookbook</h2>
 
   <h4>Health report on the last suspend cycle</h4>
 <pre><code>suspend-report</code></pre>
@@ -1010,7 +1131,7 @@ systemd-analyze cat-config systemd/logind.conf</code></pre>
 </section>
 
 <section id="gotchas">
-  <h2 class="sec"><span class="part">10 — Reference</span>Gotchas worth remembering</h2>
+  <h2 class="sec"><span class="part">11 — Reference</span>Gotchas worth remembering</h2>
   <ol class="gotchas">
     <li><p><b>update-initramfs here is a dracut shim</b>, not initramfs-tools — <code>dpkg -S /usr/sbin/update-initramfs</code> proves it. So <code>/etc/initramfs-tools/conf.d/resume</code> is <strong>inert</strong>. Worse, dracut's <code>74resume</code> <code>check()</code> <em>excludes</em> the resume module unless <code>/proc/cmdline</code> already contains <code>resume=</code> — so the initramfs must be rebuilt <strong>after</strong> the GRUB change and a reboot. Verify with <code>sudo lsinitrd /boot/initrd.img-$(uname -r) | grep -i hibernate-resume</code>.</p></li>
     <li><p><b>The kernel cannot resolve a filesystem UUID= for resume</b> — only <code>PARTUUID=</code> or a device path. <code>resume=UUID=…</code> depends entirely on the initramfs resolving it, so <code>/sys/power/resume</code> reading <code>0:0</code> after boot means the resolver is missing. Working value here is <code>259:5</code> (<code>259:3</code> before the Part five migration).</p></li>
@@ -1029,7 +1150,7 @@ systemd-analyze cat-config systemd/logind.conf</code></pre>
 </section>
 
 <section id="trouble">
-  <h2 class="sec"><span class="part">11 — Reference</span>Troubleshooting</h2>
+  <h2 class="sec"><span class="part">12 — Reference</span>Troubleshooting</h2>
 
   <h3>Machine wakes on its own again</h3>
 <pre><code>journalctl -b | grep "Triggering wakeup"   # any IRQ other than 9 = a leaked source
@@ -1068,7 +1189,7 @@ journalctl -b -u systemd-suspend-then-hibernate | grep -E "Starting|Attempting|P
 </section>
 
 <section id="undo">
-  <h2 class="sec"><span class="part">12 — Reference</span>How to undo everything</h2>
+  <h2 class="sec"><span class="part">13 — Reference</span>How to undo everything</h2>
 
   <h4>Wake-source policy</h4>
 <pre><code>sudo systemctl disable --now framework-wakeup-policy.service
@@ -1095,19 +1216,21 @@ sudo update-initramfs -u -k all &amp;&amp; sudo update-grub
 
   <h3>Maintenance notes</h3>
   <ul>
-    <li><strong>Exclude <code>/swap.img</code> from backups</strong> — Déjà Dup, Timeshift, rsync. 32 GB of swap state with no reason to archive.</li>
-    <li><strong><code>/</code> sits at ~22 GB free</strong> after the 32 GB swapfile. Keep an eye on snaps and <code>/var</code>.</li>
+    <li><strong>No swapfile to exclude from backups any more</strong> — swap is a partition, and backup tools skip it automatically.</li>
+    <li><strong><code>/</code> sits at ~57 GB free</strong> now that the 32 GB swapfile is gone. Keep an eye on snaps and <code>/var</code>.</li>
     <li><strong>Baseline: 0.44 W / 0.79 %/hour</strong> in s2idle, 100% s0i3 residency. Run <code>suspend-report</code> if something feels off.</li>
-    <li><strong>Re-run the hibernate setup if the swapfile is ever recreated.</strong></li>
+    <li><strong>Reboot reasonably promptly after a kernel upgrade.</strong> The guard makes forgetting safe rather than catastrophic, but while armed you are on plain suspend — about five days from full.</li>
+    <li><strong>Re-run <code>--self-test</code> after any systemd major-version upgrade.</strong> The guard rests on drop-in filename ordering and on logind honouring a reload; both are stable, neither is a promise.</li>
+    <li><strong>After any long unplugged stretch, check <code>journalctl --list-boots</code>.</strong> A new boot ID where you expected a resume is the only signal you get.</li>
   </ul>
 </section>
 
 </main>
 
 <footer>
-  tinkertoy · Framework 13 AMD 7840U · Ubuntu 26.04 · last updated 2026-08-19<br>
+  tinkertoy · Framework 13 AMD 7840U · Ubuntu 26.04 · last updated 2026-08-21<br>
   sources in ~/school_lab/git_repositories/framework13-suspend_hibernate/<br>
-  Manual <code>systemctl hibernate</code> and a full 2 h lid-closed suspend-then-hibernate cycle are both verified on the swap partition.
+  Verified on the swap partition: manual <code>systemctl hibernate</code>, a full 2 h lid-closed cycle, and a 16 h 55 m overnight hibernation that resumed into the same boot ID for under 1% of the battery.
 </footer>
 
 </div>

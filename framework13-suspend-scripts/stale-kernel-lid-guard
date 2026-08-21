@@ -1,0 +1,236 @@
+#!/bin/sh
+# stale-kernel-lid-guard -- stop a lid close from hibernating into an image
+# the next boot cannot restore.
+#
+# WHY THIS EXISTS
+#   A hibernation image is stamped with the kernel that wrote it (uts_release).
+#   A kernel that differs at all refuses to restore it, and GRUB here boots the
+#   newest installed kernel unconditionally (GRUB_DEFAULT=0, GRUB_TIMEOUT=0).
+#   So between "apt installed a new kernel" and "you rebooted into it", every
+#   hibernation is a one-way trip -- and nothing warns you.
+#
+#   That window cost a full session on 2026-08-19.  Kernel 7.0.0-30 was
+#   installed at 18:26:14; the lid closed at 18:33:12 still running 7.0.0-29;
+#   suspend-then-hibernate fired at 20:33:15; the next boot came up on -30 and
+#   logged "PM: Image not found (code -22)".  The hibernate also never finished
+#   powering the machine off, so it sat at ~1.7 W and burned 72% of the battery
+#   overnight.  See the runbook, Part 7.
+#
+# WHAT IT DOES
+#   While the running kernel is not the newest installed one, drop a logind
+#   override that turns a lid close into a plain suspend.  Nothing is written
+#   to disk, so there is nothing for the next boot to reject.
+#
+#   The override lives in /run, which is tmpfs.  It therefore evaporates on the
+#   next boot -- which is exactly the event that resolves the condition -- so
+#   there is no state to clean up and no flag that can get stuck armed.
+#   Rebooting is both the fix and the reset.
+#
+#   Precedence: our 99- prefix sorts after the shipped 10-lid-sleep.conf, and
+#   systemd sorts drop-ins by basename across /etc, /run and /usr, so this wins
+#   despite living in a lower-priority directory.  --self-test proves it.
+#
+# WHAT IT DOES NOT COVER
+#   An explicit "systemctl hibernate", and UPower's CriticalPowerAction
+#   (HybridSleep here) if the battery runs flat while suspended.  Neither is a
+#   real loss: with a stale kernel there is no configuration that survives a
+#   dead battery, since the only image that could be restored is one written by
+#   the kernel you are not running.  Plain suspend at ~0.44 W gives roughly
+#   five days from full, which is the window you have to reboot.
+#
+# USAGE
+#   stale-kernel-lid-guard              evaluate, then arm or disarm as needed
+#   stale-kernel-lid-guard --status     report state, change nothing
+#   stale-kernel-lid-guard --self-test  prove logind honours the override (root)
+#
+# Run at boot by stale-kernel-lid-guard.service and on every kernel install by
+# /etc/kernel/postinst.d/zzz-stale-kernel-lid-guard.
+
+set -eu
+
+DROPIN_DIR=/run/systemd/logind.conf.d
+DROPIN="$DROPIN_DIR/99-stale-kernel.conf"
+TAG=stale-kernel-lid-guard
+
+log() {
+    logger -t "$TAG" -- "$*" 2>/dev/null || true
+    if [ -t 1 ]; then printf '%s\n' "$*"; fi
+}
+
+# Newest kernel on disk.  linux-version is the canonical Debian/Ubuntu tool;
+# fall back to sorting /boot by version if the linux-base package is missing.
+newest_kernel() {
+    if command -v linux-version >/dev/null 2>&1; then
+        linux-version list 2>/dev/null | linux-version sort --reverse 2>/dev/null | head -n1
+        return 0
+    fi
+    for f in /boot/vmlinuz-*; do
+        [ -e "$f" ] || continue
+        printf '%s\n' "${f#/boot/vmlinuz-}"
+    done | sort -V | tail -n1
+}
+
+reload_logind() {
+    # Not fatal if logind is not up yet: the drop-in is read at its start too.
+    systemctl reload systemd-logind >/dev/null 2>&1 || true
+}
+
+# The effective lid action, straight from logind rather than from our own
+# config files -- this is what actually decides what a lid close does.
+lid_action() {
+    busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager HandleLidSwitch 2>/dev/null |
+        sed -n 's/^s "\(.*\)"$/\1/p'
+}
+
+# Best-effort desktop notification to every graphical session.  The whole
+# failure mode is invisibility, so it is worth telling someone.  Keep the
+# strings free of single quotes -- they are interpolated into a shell command.
+notify() {
+    command -v notify-send >/dev/null 2>&1 || return 0
+    command -v loginctl >/dev/null 2>&1 || return 0
+    loginctl list-sessions --no-legend 2>/dev/null | awk '{print $2, $3}' | sort -u |
+    while read -r uid user; do
+        [ -S "/run/user/$uid/bus" ] || continue
+        su -s /bin/sh "$user" -c \
+"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus notify-send -u critical -i system-reboot \"$1\" \"$2\"" \
+            >/dev/null 2>&1 || true
+    done
+    return 0
+}
+
+# Write the drop-in. Returns 0 if it changed something, 1 if already correct,
+# so the caller can avoid a pointless logind reload and a duplicate notify.
+arm() {
+    _running=$1
+    _newest=$2
+    _desired=$(cat <<EOF
+# Written by $TAG -- do not edit.  This file is on tmpfs and is
+# regenerated or removed at boot and on every kernel install.
+#
+# Running kernel : $_running
+# Newest on disk : $_newest
+#
+# Hibernating now would write an image the next boot's kernel cannot restore,
+# so a lid close plain-suspends until you reboot.
+[Login]
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+EOF
+)
+    if [ -e "$DROPIN" ] && [ "$(cat "$DROPIN")" = "$_desired" ]; then
+        return 1
+    fi
+    mkdir -p "$DROPIN_DIR"
+    printf '%s\n' "$_desired" > "$DROPIN"
+    chmod 0644 "$DROPIN"
+    reload_logind
+    return 0
+}
+
+disarm() {
+    if [ ! -e "$DROPIN" ]; then
+        return 1
+    fi
+    rm -f "$DROPIN"
+    rmdir "$DROPIN_DIR" 2>/dev/null || true
+    reload_logind
+    return 0
+}
+
+# ---------------------------------------------------------------- evaluation
+
+running=$(uname -r)
+newest=$(newest_kernel 2>/dev/null || true)
+
+if [ -z "$newest" ]; then
+    # Cannot tell.  Arm: a false positive costs a plain suspend, a false
+    # negative costs a session.  Self-corrects at the next boot.
+    newest=unknown
+    stale=yes
+elif [ "$running" = "$newest" ]; then
+    stale=no
+else
+    stale=yes
+fi
+
+case "${1:-}" in
+--status)
+    printf 'running kernel : %s\n' "$running"
+    printf 'newest on disk : %s\n' "$newest"
+    if [ "$stale" = yes ]; then
+        printf 'verdict        : STALE -- hibernation is unsafe, guard should be armed\n'
+    else
+        printf 'verdict        : up to date -- hibernation is safe\n'
+    fi
+    if [ -e "$DROPIN" ]; then
+        printf 'guard          : ARMED (lid close will suspend, not hibernate)\n'
+        printf 'to clear       : reboot\n'
+    else
+        printf 'guard          : not armed (suspend-then-hibernate active)\n'
+    fi
+    printf 'logind reports : HandleLidSwitch=%s\n' "$(lid_action)"
+    # Verdict and reality should agree. If they do not, the boot unit or the
+    # kernel hook did not run -- say so rather than quietly reporting a state.
+    if [ "$stale" = yes ] && [ ! -e "$DROPIN" ]; then
+        printf 'WARNING        : kernel is stale but the guard is NOT armed.\n'
+        printf '                 Run this script as root to arm it, and check\n'
+        printf '                 systemctl status stale-kernel-lid-guard.service\n'
+    elif [ "$stale" = no ] && [ -e "$DROPIN" ]; then
+        printf 'WARNING        : guard armed but kernel is current; run as root to clear.\n'
+    fi
+    exit 0
+    ;;
+--self-test)
+    if [ "$(id -u)" -ne 0 ]; then
+        printf 'Must run as root (writes %s).\n' "$DROPIN_DIR" >&2
+        exit 1
+    fi
+    printf 'Proving logind honours the override. This changes nothing permanently.\n\n'
+    _before=$(lid_action)
+    printf '  baseline      HandleLidSwitch=%s\n' "$_before"
+    arm "$running" "self-test (not a real kernel change)" || true
+    _during=$(lid_action)
+    printf '  guard armed   HandleLidSwitch=%s\n' "$_during"
+    disarm || true
+    _after=$(lid_action)
+    printf '  guard cleared HandleLidSwitch=%s\n\n' "$_after"
+    _rc=0
+    if [ "$_during" != suspend ]; then
+        printf 'FAIL: arming did not change the lid action to suspend.\n' >&2
+        printf '      The /run drop-in is not winning over /etc.\n' >&2
+        _rc=1
+    fi
+    if [ "$_after" != "$_before" ]; then
+        printf 'FAIL: disarming did not restore %s.\n' "$_before" >&2
+        _rc=1
+    fi
+    if [ "$_rc" -eq 0 ]; then
+        printf 'PASS: %s -> suspend -> %s. The guard works.\n' "$_before" "$_after"
+    fi
+    # Leave the system in whatever state the real evaluation calls for.
+    if [ "$stale" = yes ]; then
+        arm "$running" "$newest" || true
+    fi
+    exit "$_rc"
+    ;;
+esac
+
+if [ "$stale" = no ]; then
+    if disarm; then
+        log "disarmed: running newest kernel $running, suspend-then-hibernate restored"
+    fi
+    exit 0
+fi
+
+if arm "$running" "$newest"; then
+    log "ARMED: running $running but $newest is installed; lid close will suspend, not hibernate. Reboot to restore suspend-then-hibernate."
+    if [ "$newest" = unknown ]; then
+        notify "Reboot before closing the lid" \
+               "Could not determine the newest installed kernel, so hibernation is being treated as unsafe. Closing the lid will suspend instead. Reboot to clear this."
+    else
+        notify "Kernel updated - reboot before closing the lid" \
+               "Running $running but $newest is installed. Until you reboot, closing the lid will suspend instead of hibernating, to avoid losing your session."
+    fi
+fi
+exit 0

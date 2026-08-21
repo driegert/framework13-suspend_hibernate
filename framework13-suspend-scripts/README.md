@@ -18,6 +18,9 @@ without root — diff them if you want to be sure).
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) |
 | `10-lid-sleep.conf` | `/etc/systemd/logind.conf.d/` (0644) |
 | `10-hibernate-reserve.conf` | `/etc/UPower/UPower.conf.d/` (0644) |
+| `stale-kernel-lid-guard` | `/usr/local/sbin/` (0755) |
+| `stale-kernel-lid-guard.service` | `/etc/systemd/system/` (0644) |
+| `zzz-stale-kernel-lid-guard` | `/etc/kernel/postinst.d/` (0755) |
 | `suspend-report` | `~/.local/bin/` (0755) |
 | `setup-hibernate.sh` | run once with sudo; not installed |
 
@@ -51,12 +54,21 @@ sudo reboot
 sudo install -D -m 0644 "$D/10-hibernate-reserve.conf" /etc/UPower/UPower.conf.d/10-hibernate-reserve.conf
 sudo systemctl restart upower
 
-# 6. health check
+# 6. stale-kernel lid guard -- stops a lid close from hibernating into an
+#    image the next boot cannot restore (see Part 7 of the write-up)
+sudo install -m 0755 "$D/stale-kernel-lid-guard"            /usr/local/sbin/stale-kernel-lid-guard
+sudo install -D -m 0644 "$D/stale-kernel-lid-guard.service" /etc/systemd/system/stale-kernel-lid-guard.service
+sudo install -D -m 0755 "$D/zzz-stale-kernel-lid-guard"     /etc/kernel/postinst.d/zzz-stale-kernel-lid-guard
+sudo systemctl daemon-reload
+sudo systemctl enable --now stale-kernel-lid-guard.service
+sudo /usr/local/sbin/stale-kernel-lid-guard --self-test    # must print PASS
+
+# 7. health check
 install -m 0755 "$D/suspend-report" ~/.local/bin/suspend-report
 suspend-report
 ```
 
-## The one that bites
+## The ones that bite
 
 **Re-run `setup-hibernate.sh` if `/swap.img` is ever recreated, resized, or
 restored from a backup.** The physical offset changes; a stale `resume_offset`
@@ -68,3 +80,16 @@ get a silently lost session: an image write that doesn't complete leaves the
 same `PM: Image not found (code -22)` on the next boot, because swsusp writes
 the header signature last. See "A lost session, diagnosed" in
 `../framework13-suspend-hibernate.md`.
+
+**Reboot after a kernel upgrade before you close the lid.** A hibernation image
+is stamped with the kernel that wrote it and no other kernel will restore it,
+while GRUB boots the newest installed kernel — so between `apt` landing a kernel
+and your next reboot, hibernating loses the session. `stale-kernel-lid-guard`
+now makes that safe by forcing plain suspend in that window, but it is only
+installed if you ran step 6 above. Check with:
+
+```sh
+stale-kernel-lid-guard --status
+```
+
+See "The kernel-upgrade trap" in `../framework13-suspend-hibernate.md`.

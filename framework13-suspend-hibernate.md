@@ -16,11 +16,12 @@ non-obvious traps that cost the most time.
 6. [Part 4 — suspend-then-hibernate](#part-4--suspend-then-hibernate)
 7. [Part 5 — Migrating to a swap partition](#part-5--migrating-to-a-swap-partition)
 8. [Part 6 — A lost session, diagnosed](#part-6--a-lost-session-diagnosed)
-9. [Installed files — full inventory](#installed-files--full-inventory)
-10. [Diagnostic cookbook](#diagnostic-cookbook)
-11. [Gotchas worth remembering](#gotchas-worth-remembering)
-12. [Troubleshooting](#troubleshooting)
-13. [How to undo everything](#how-to-undo-everything)
+9. [Part 7 — The kernel-upgrade trap](#part-7--the-kernel-upgrade-trap)
+10. [Installed files — full inventory](#installed-files--full-inventory)
+11. [Diagnostic cookbook](#diagnostic-cookbook)
+12. [Gotchas worth remembering](#gotchas-worth-remembering)
+13. [Troubleshooting](#troubleshooting)
+14. [How to undo everything](#how-to-undo-everything)
 
 ---
 
@@ -36,6 +37,8 @@ non-obvious traps that cost the most time.
 | Hibernate | disabled and unconfigured | working, **64 GB swap partition** |
 | Resume fragility | — | `resume_offset` eliminated; nothing left to drift |
 | Emergency hibernate reserve | 2% of battery (packaged default) | **7%** |
+| Hibernating on a stale kernel | silently lost the session **and** 72% of the battery | lid plain-suspends until you reboot |
+| WiFi back after hibernate resume | ~18 s (MT7922 firmware reload) | **~4 s** (AX210, clean restore) |
 
 **Day-to-day behaviour now**
 
@@ -45,6 +48,7 @@ non-obvious traps that cost the most time.
 - Waking → **power button or lid only**. Keyboard and touchpad will *not* wake it.
 - Unplugging the charger no longer wakes it — the original complaint
 - Battery critically low while awake → hibernates at 7%, with enough charge left to finish writing the image
+- **A kernel was installed but not yet booted** → lid closed *plain-suspends* instead of hibernating, until you reboot ([Part 7](#part-7--the-kernel-upgrade-trap))
 
 ---
 
@@ -793,6 +797,186 @@ covers the battery actually dying.
 
 ---
 
+## Part 7 — The kernel-upgrade trap
+
+*2026-08-19 → 08-21.* A second lost session, four days after
+[Part 6](#part-6--a-lost-session-diagnosed) — same `-22`, entirely different
+cause. The machine was left at ~93% with the lid shut and came back the next
+evening at 22%, cold-booted, session gone.
+
+The initial suspicion was the WiFi card, which had been swapped that afternoon.
+It was the wrong suspect, and ruling it out took one line of log.
+
+### The timeline
+
+```
+Aug 19 18:22:17  hibernation exit          <- a 2 h cycle that worked perfectly
+Aug 19 18:25:16  apt upgrade starts        (Requested-By: dave)
+Aug 19 18:26:14  linux-image-generic-hwe-26.04  7.0.0-29 -> 7.0.0-30
+Aug 19 18:33:12  Lid closed.               <- still running 7.0.0-29
+Aug 19 18:33:14  PM: suspend entry (s2idle)
+Aug 19 20:33:14  Timekeeping suspended for 7199.006 seconds
+Aug 19 20:33:15  Performing sleep operation 'hibernate'...
+Aug 19 20:33:15  PM: hibernation: hibernation entry     <- last log, ever
+Aug 20 18:16:15  cold boot, GRUB picks 7.0.0-30, RTC reset to 2023-01-01
+Aug 20 18:16:03  PM: Image not found (code -22)
+```
+
+The upgrade **finished** seven minutes before the lid closed. Nothing was
+mid-flight; dpkg was done and the system was idle. The trap is subtler than
+"don't touch a laptop during an update": installing a kernel and *booting* it
+are separate events, and hibernation silently depends on the second one.
+
+### Two independent failures
+
+Either one alone would have cost the session.
+
+**1. The hibernate never completed.** `-22` is `-EINVAL` out of `swsusp_check()`
+— the `S1SUSPEND` signature is not on the swap partition. Per
+[gotcha 10](#gotchas-worth-remembering) that signature is written *last*, so its
+absence means the write did not finish. The battery proves the machine never
+powered off (below).
+
+**2. The image would have been rejected anyway.** The EFI pointer records who
+wrote it:
+
+```
+systemd-hibernate-resume-generator: Reported hibernation image:
+    ID=ubuntu VERSION_ID=26.04 kernel=7.0.0-29-generic
+    UUID=d7158588-… offset=0
+```
+
+`GRUB_DEFAULT=0` with `GRUB_TIMEOUT=0` boots the newest installed kernel
+unconditionally, so the machine came up on 7.0.0-30. swsusp compares
+`uts_release` in the image header and refuses a mismatch. **The session was
+unrecoverable the moment the upgrade landed**, independent of the write failing.
+
+> Note the two failures produce *different* errors. A kernel mismatch on a
+> valid image gives `PM: Image mismatch`, not `Image not found`. Seeing `-22`
+> means the write failed first; the mismatch never got a chance to fire.
+
+### The battery arithmetic
+
+This is what separated "hibernated" from "hung pretending to". At
+`energy-full = 53.85 Wh`, 1% = 0.538 Wh:
+
+| State | Draw | Per hour | Per day |
+|---|---|---|---|
+| Hibernated / off | ~0 W | 0% | 0% |
+| Correct s2idle (s0i3) | 0.44 W | 0.8% | ~20% |
+| **What actually happened** | **1.74 W** | **3.2%** | **~78%** |
+| Awake, idle | ~6 W | 11% | — |
+
+```
+ 93%  Aug 19 18:30:28   last sample before the lid closed
+  −0.4%   ~3 min awake
+  −1.6%   2 h of real s2idle @ 0.44 W      <- this part worked correctly
+ −70.2%   21.7 h hung @ 1.74 W             <- the entire loss
+ ────
+ 21%  Aug 20 18:16:59   first sample after the cold boot
+```
+
+1.74 W is unremarkable — 4× a correct suspend, a quarter of an idle awake
+machine. Invisible over an evening, fatal over a day: from full it flattens the
+battery in **31 hours**. The RTC coming up at `2023-01-01` says the machine
+eventually lost power entirely; EFI NVRAM survived (SPI flash, no backup power
+needed), which is why the hibernate pointer was still readable.
+
+**Hibernation draws 0 W because the machine is off. Any measurable drain across
+a hibernation means it never got there.** That single fact is the diagnostic.
+
+### The WiFi card was not involved
+
+The card had been swapped from MT7922 to AX210 that afternoon, which made it the
+obvious suspect. One line settles it:
+
+```
+Aug 19 14:35:28  iwlwifi 0000:01:00.0: Detected Intel(R) Wi-Fi 6E AX210 160MHz
+```
+
+The AX210 was already installed at the *start* of the boot that then ran
+suspend-then-hibernate three times flawlessly, including a full 2 h cycle
+resuming at 18:22. A component present during the successes cannot explain the
+failure. (It did improve things — see [gotcha 8](#gotchas-worth-remembering).)
+
+### The fix — a stale-kernel lid guard
+
+The rule to enforce: **while the running kernel is not the newest installed one,
+a lid close must not escalate to hibernation.**
+
+`/usr/local/sbin/stale-kernel-lid-guard` compares `uname -r` against
+`linux-version list | linux-version sort --reverse | head -1`. If they differ it
+writes `/run/systemd/logind.conf.d/99-stale-kernel.conf`:
+
+```ini
+[Login]
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+```
+
+and reloads logind. Plain suspend is resumed from RAM by the kernel already
+running — no image, no disk, no version check, nothing to reject.
+
+Two properties make this safe to forget about:
+
+- **The override lives on tmpfs.** `/run` is cleared at boot, and rebooting is
+  exactly the event that resolves the condition. There is no state file, no flag
+  that can stick armed, and no cleanup path to get wrong. *Rebooting is both the
+  fix and the reset.*
+- **`99-` beats `10-`.** systemd orders drop-ins by filename across `/etc`,
+  `/run` and `/usr`, so a `/run` file wins despite the lower-priority directory
+  ([gotcha 15](#gotchas-worth-remembering)).
+
+Two triggers, because there are two ways to end up on a stale kernel:
+
+| Trigger | Covers |
+|---|---|
+| `/etc/kernel/postinst.d/zzz-stale-kernel-lid-guard` | apt installs a kernel and you don't reboot — the case that caused this |
+| `stale-kernel-lid-guard.service` (boot) | you deliberately pick an older kernel from the GRUB menu |
+
+It also fires a desktop notification when it arms, since the whole failure mode
+is invisibility.
+
+### What it does not cover
+
+An explicit `systemctl hibernate`, and UPower's `CriticalPowerAction`
+(`HybridSleep` here) if the battery runs flat while suspended.
+
+Neither is a real loss, and this is worth being precise about rather than
+"fixing": **with a stale kernel there is no configuration that survives a dead
+battery**, because the only restorable image is one written by the kernel you
+are not running. Masking hibernation would swap one lost session for an
+identical one, and would forfeit the case where you plug in before it dies.
+Plain suspend at 0.44 W gives roughly **five days** from full — that is the
+window you have to reboot in.
+
+### Verifying it
+
+The guard fires only during rare events, so it ships with a self-test that
+proves the mechanism end to end rather than asserting it:
+
+```bash
+sudo /usr/local/sbin/stale-kernel-lid-guard --self-test
+#   baseline      HandleLidSwitch=sleep
+#   guard armed   HandleLidSwitch=suspend
+#   guard cleared HandleLidSwitch=sleep
+#   PASS: sleep -> suspend -> sleep. The guard works.
+```
+
+It reads the *effective* value from logind over D-Bus, not from the config files
+it just wrote, and restores whatever the real evaluation calls for afterwards.
+
+```bash
+stale-kernel-lid-guard --status     # verdict + armed state, warns if they disagree
+```
+
+`--status` deliberately reports the **verdict** as well as the file state: a
+bare file check would report "not armed" on a stale kernel, which is true and
+useless. A disagreement between the two means the boot unit or the kernel hook
+did not run.
+
+---
+
 ## Installed files — full inventory
 
 | Path | Purpose |
@@ -803,12 +987,16 @@ covers the battery actually dying.
 | `/etc/polkit-1/rules.d/10-enable-hibernate.rules` | Overrides Ubuntu's blanket hibernate denial (local + active only) |
 | `/etc/systemd/sleep.conf.d/10-hibernate-delay.conf` | `HibernateDelaySec=2h`, `HibernateOnACPower=no` |
 | `/etc/systemd/logind.conf.d/10-lid-sleep.conf` | `HandleLidSwitch=sleep` (+ external power) |
+| `/usr/local/sbin/stale-kernel-lid-guard` | Forces plain suspend on a lid close while the running kernel isn't the newest installed (see [Part 7](#part-7--the-kernel-upgrade-trap)). `--status`, `--self-test`. |
+| `/etc/systemd/system/stale-kernel-lid-guard.service` | Evaluates the guard at boot — catches booting an old kernel from the GRUB menu |
+| `/etc/kernel/postinst.d/zzz-stale-kernel-lid-guard` | Evaluates the guard whenever apt installs a kernel. `zzz-` sorts after `zz-update-grub`. |
+| `/run/systemd/logind.conf.d/99-stale-kernel.conf` | **Written at runtime, tmpfs, not installed.** Present only while the guard is armed; gone after a reboot. |
 | `/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf` | Raises the emergency-hibernate battery floor from 2% to 7% (see [Part 6](#part-6--a-lost-session-diagnosed)) |
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
 | `/etc/default/grub` | `resume=UUID=<your-swap-uuid>` appended — **no `resume_offset`**; timestamped `.bak` alongside |
 | `/etc/fstab` | swap entry now `UUID=<your-swap-uuid>`; the old `/swap.img` line commented out, timestamped `.bak` alongside |
 
-**Current verified state** *(2026-08-19)*
+**Current verified state** *(2026-08-21)*
 
 ```
 armed wake sources:  PNP0C0D (lid), PNP0C0C (power button), pnp0/00:00 + rtc0/alarmtimer
@@ -818,6 +1006,8 @@ swap                     = 64 G at /dev/nvme0n1p5, contiguous
 /                        = 36% used, 57 G free
 UPower PercentageAction  = 7.0            (packaged default 2.0)
 CanSuspend / CanHibernate / CanSuspendThenHibernate = yes / yes / yes
+stale-kernel lid guard   = installed, enabled, self-test PASS, not armed
+WiFi                     = Intel AX210 (iwlwifi), ~4 s to activated after resume
 ```
 
 `/swap.img` is **gone** — deleted only after a resume from the partition was
@@ -881,6 +1071,15 @@ journalctl -b | grep 'Adding .* swap on'
 # Who is blocking sleep / the lid
 systemd-inhibit --list
 
+# Is hibernation currently safe? (stale kernel = lid will plain-suspend)
+stale-kernel-lid-guard --status
+uname -r; linux-version list | linux-version sort --reverse | head -1
+
+# What logind will ACTUALLY do with the lid, straight from the daemon.
+# "sleep" = normal (suspend-then-hibernate); "suspend" = guard armed.
+busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager HandleLidSwitch
+
 # Effective merged config
 systemd-analyze cat-config systemd/sleep.conf
 systemd-analyze cat-config systemd/logind.conf
@@ -927,9 +1126,15 @@ systemd-analyze cat-config systemd/logind.conf
    the console is suspended and the ring buffer flushes on wake. So
    `Suspending console(s)` legitimately appears *after* `Lid opened`.
 
-8. **MT7922 WiFi fails `pci_pm_restore` (-110) on hibernate resume** and does a
-   full firmware reload instead. Not a fault — but WiFi takes **~18 s** to come
-   back (vs ~3 s from s2idle). Worth knowing before walking into a lecture.
+8. **WiFi resume cost depends on the card, and this one changed.** The original
+   MT7922 failed `pci_pm_restore` (-110) on hibernate resume and did a full
+   firmware reload, taking **~18 s** to come back (vs ~3 s from s2idle) — worth
+   knowing before walking into a lecture. It was swapped for an **Intel AX210**
+   on 2026-08-19 for unrelated association-loss problems, and the AX210 restores
+   cleanly: no `pci_pm_restore` failure, no firmware reload, `PM: restore of
+   devices complete after 648 msecs`, and NetworkManager reporting `activated`
+   **4 s** after resume. If the card is ever swapped again, re-measure — this
+   number is a property of the driver, not of the hibernate configuration.
 
 9. **`filefrag` reports in filesystem blocks (4096 B here)**, matching the page
    size, so the value is directly usable as `resume_offset`. Confirmed
@@ -956,6 +1161,26 @@ systemd-analyze cat-config systemd/logind.conf
     without complaint. The thresholds are also not exposed on D-Bus, so
     verification is limited to a clean restart plus `GetCriticalAction`.
 
+14. **Installing a kernel and booting it are separate events, and hibernation
+    silently depends on the second one.** A swsusp image is stamped with the
+    kernel that wrote it; any other kernel refuses it. With `GRUB_DEFAULT=0` the
+    next boot takes the *newest installed* kernel, so from the moment apt lands a
+    kernel until you reboot, every hibernation is a one-way trip. Nothing warns
+    you — `/var/run/reboot-required` exists but no desktop surface shows it at
+    lid-close time. This is what [Part 7](#part-7--the-kernel-upgrade-trap) is
+    about, and what the lid guard now prevents.
+
+15. **systemd drop-ins are ordered by *filename*, across all search directories.**
+    `/run/systemd/logind.conf.d/99-x.conf` beats `/etc/systemd/logind.conf.d/10-y.conf`
+    even though `/etc` is the higher-priority *directory* — the `99-` prefix is
+    what decides. That is what lets the lid guard live entirely on tmpfs and
+    disappear at reboot. Read the effective value from logind rather than
+    inferring it from files:
+    ```bash
+    busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager HandleLidSwitch
+    ```
+
 ---
 
 ## Troubleshooting
@@ -972,6 +1197,28 @@ sudo /usr/local/sbin/framework-wakeup-policy  # re-apply by hand
 suspend-report        # residency well below 95% means s0i3 isn't being reached
 journalctl -b | grep "deepest state"
 ```
+If the drain spans a *hibernation*, residency is the wrong place to look —
+hibernation is 0 W, so **any** measurable loss means it never powered off. See
+[Part 7](#part-7--the-kernel-upgrade-trap).
+
+**The lid suspends but no longer hibernates after 2 h**
+```bash
+stale-kernel-lid-guard --status     # "ARMED" = working as intended; reboot to clear
+```
+Expected right after a kernel upgrade. If it says ARMED and you have already
+rebooted, the `/run` file should have vanished — check
+`systemctl status stale-kernel-lid-guard.service`.
+
+**Session lost across a hibernate**
+```bash
+journalctl --list-boots | tail -3            # new boot ID = the resume failed
+journalctl -b 0 | grep -E "PM: Image (not found|mismatch)"
+journalctl -b 0 | grep "Reported hibernation image"   # which kernel wrote it
+uname -r                                              # which kernel read it
+```
+A `kernel=` in the reported image that differs from `uname -r` is the Part 7
+failure. `Image not found (code -22)` on its own is an incomplete write
+([gotcha 10](#gotchas-worth-remembering)).
 
 **The machine "just started" instead of resuming — session lost**
 Work it in this order; the full worked example is
@@ -1037,6 +1284,19 @@ sudo systemctl daemon-reload
 # wake sources return to kernel defaults on next reboot
 ```
 
+**Stale-kernel lid guard**
+```bash
+sudo systemctl disable --now stale-kernel-lid-guard.service
+sudo rm -f /etc/systemd/system/stale-kernel-lid-guard.service \
+           /etc/kernel/postinst.d/zzz-stale-kernel-lid-guard \
+           /usr/local/sbin/stale-kernel-lid-guard \
+           /run/systemd/logind.conf.d/99-stale-kernel.conf
+sudo systemctl daemon-reload
+sudo systemctl reload systemd-logind
+```
+Removing it restores the old behaviour: hibernating on a stale kernel silently
+loses the session.
+
 **suspend-then-hibernate (keep plain suspend)**
 ```bash
 sudo rm /etc/systemd/logind.conf.d/10-lid-sleep.conf \
@@ -1073,9 +1333,20 @@ back from a live USB.
   boot ID where you expected a resume is the only signal you'll get.
 - **If the swap partition is ever recreated, re-run `setup-hibernate.sh`** — the
   UUID changes even though there's no offset to worry about.
+- **Reboot reasonably promptly after a kernel upgrade.** The guard makes
+  forgetting safe rather than catastrophic, but while it's armed you're on plain
+  suspend — ~0.8%/hour, about five days from full before the battery matters.
+- **Re-run `--self-test` after any systemd major-version upgrade.** The guard
+  rests on drop-in filename ordering and on logind honouring a reload; both are
+  stable, neither is a promise. The test is non-destructive and takes a second.
+- **If the WiFi card is swapped again, re-measure the resume time**
+  ([gotcha 8](#gotchas-worth-remembering)) — it's a driver property, not a
+  hibernate one.
 
 ---
 
-*Last updated 2026-08-19. Nothing outstanding: manual `systemctl hibernate` and
-a full 2 h lid-closed suspend-then-hibernate cycle are both verified on the swap
-partition.*
+*Last updated 2026-08-21. Nothing outstanding. Verified on the swap partition:
+manual `systemctl hibernate`, a full 2 h lid-closed suspend-then-hibernate
+cycle, and a 16 h 55 m overnight hibernation that resumed into the same boot ID
+at a cost of well under 1% of the battery. The stale-kernel lid guard is
+installed, enabled, and passes its self-test.*

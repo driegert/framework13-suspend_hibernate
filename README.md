@@ -4,7 +4,7 @@ Scripts and config to stop a Framework 13 (AMD Ryzen 7840U) draining its
 battery while it's supposed to be asleep, on Ubuntu.
 
 Developed on a Framework 13 AMD / Ryzen 7 7840U running Ubuntu 26.04, kernel
-7.0.0-29, systemd 259, GNOME/Wayland. Most of it applies to any AMD Framework;
+7.0.0-30, systemd 259, GNOME/Wayland. Most of it applies to any AMD Framework;
 the parts that don't are called out in [Portability](#portability).
 
 **Result on the test machine:**
@@ -111,6 +111,9 @@ nodes). If it reports 20-something today, this repo is for you.
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) | ✅ tune to taste |
 | `10-lid-sleep.conf` | `/etc/systemd/logind.conf.d/` (0644) | ✅ tune to taste |
 | `10-hibernate-reserve.conf` | `/etc/UPower/UPower.conf.d/` (0644) | ✅ as-is |
+| `stale-kernel-lid-guard` | `/usr/local/sbin/` (0755) | ✅ as-is |
+| `stale-kernel-lid-guard.service` | `/etc/systemd/system/` (0644) | ✅ as-is |
+| `zzz-stale-kernel-lid-guard` | `/etc/kernel/postinst.d/` (0755) | ⚠️ Debian/Ubuntu kernel hooks |
 | `suspend-report` | `~/.local/bin/` (0755) | ⚠️ edit battery model |
 
 All of it lives in [`framework13-suspend-scripts/`](framework13-suspend-scripts/).
@@ -198,6 +201,40 @@ logind pick the best available option *at the moment the lid closes*, trying
 `suspend-then-hibernate → hybrid-sleep → suspend → hibernate` in order. So if
 hibernation ever breaks — swapfile recreated, kernel change — **the lid falls
 back to a plain suspend by itself** instead of failing to sleep at all.
+
+### Part 5 — `stale-kernel-lid-guard`
+
+Closes a trap that costs you an entire session, silently, and is easy to walk
+into: **installing a kernel and booting it are separate events, and hibernation
+depends on the second one.**
+
+A hibernation image is stamped with the kernel that wrote it. Any other kernel
+refuses to restore it — and with `GRUB_DEFAULT=0` the next boot takes the
+*newest installed* kernel. So from the moment apt lands a kernel until you
+reboot, every hibernation is one-way. Nothing warns you at lid-close time.
+
+This cost a real session here: kernel installed at 18:26, lid closed at 18:33,
+suspend-then-hibernate fired at 20:33, next boot came up on the new kernel with
+`PM: Image not found (code -22)`. The machine also never finished powering off,
+so it sat at ~1.7 W and lost 72% of the battery overnight.
+
+The guard compares `uname -r` against the newest installed kernel. While they
+differ it drops a logind override making a lid close a **plain suspend** —
+resumed from RAM by the kernel already running, so there is no image and nothing
+to reject. It runs from a kernel-install hook and again at every boot.
+
+The override is written to `/run` (tmpfs), so it disappears on reboot — which is
+precisely the event that resolves the condition. No state file, no flag that can
+stick armed. *Rebooting is both the fix and the reset.*
+
+```sh
+stale-kernel-lid-guard --status       # verdict + whether it's armed
+sudo stale-kernel-lid-guard --self-test   # proves logind honours the override
+```
+
+The self-test exists because the guard only fires during rare events; it reads
+the effective lid action back from logind over D-Bus rather than trusting the
+file it just wrote, then restores normal state.
 
 ### Part 4 — `suspend-report`
 
@@ -486,6 +523,24 @@ systemd-analyze cat-config systemd/sleep.conf
 systemd-analyze cat-config systemd/logind.conf
 ```
 
+### Step 5 — the stale-kernel lid guard
+
+Strongly recommended if you ever install kernel updates and don't reboot
+immediately — see [Part 5](#part-5--stale-kernel-lid-guard) for what it prevents.
+
+```sh
+sudo install -m 0755 "$D/stale-kernel-lid-guard"            /usr/local/sbin/stale-kernel-lid-guard
+sudo install -D -m 0644 "$D/stale-kernel-lid-guard.service" /etc/systemd/system/stale-kernel-lid-guard.service
+sudo install -D -m 0755 "$D/zzz-stale-kernel-lid-guard"     /etc/kernel/postinst.d/zzz-stale-kernel-lid-guard
+sudo systemctl daemon-reload
+sudo systemctl enable --now stale-kernel-lid-guard.service
+sudo /usr/local/sbin/stale-kernel-lid-guard --self-test
+```
+
+The self-test must report `PASS`. It arms the guard, confirms logind actually
+switched the lid action to `suspend`, clears it, and confirms it switched back —
+leaving the system in whatever state the real check calls for.
+
 ---
 
 ## What you get, day to day
@@ -495,6 +550,7 @@ systemd-analyze cat-config systemd/logind.conf
 - On AC → suspends, never hibernates
 - Waking → **power button or lid only**; keyboard and touchpad won't
 - Unplugging the charger no longer wakes it
+- A kernel installed but not yet booted → lid closed **plain-suspends** until you reboot
 
 ---
 
@@ -580,9 +636,38 @@ lid events for 30 s after any resume. Check with `systemd-inhibit --list`.
 
 **WiFi takes ages after hibernate**
 
-Expected. The MT7922 fails `pci_pm_restore` and does a full firmware reload:
-~18 s, versus ~3 s from s2idle. Not a fault, but worth knowing before you walk
-into a meeting.
+Card-dependent, and worth measuring rather than assuming. The MT7922 this was
+developed on fails `pci_pm_restore` (-110) and does a full firmware reload:
+**~18 s**, versus ~3 s from s2idle. Swapping it for an Intel AX210 removed the
+problem entirely — clean restore, `activated` **~4 s** after resume. Not a fault
+either way, but worth knowing before you walk into a meeting.
+
+```sh
+journalctl -b | grep -E "pci_pm_restore|state change.*activated"
+```
+
+**The lid suspends but never hibernates any more**
+
+Almost certainly the [stale-kernel guard](#part-5--stale-kernel-lid-guard) doing
+its job after a kernel update:
+
+```sh
+stale-kernel-lid-guard --status    # "ARMED" = expected; reboot to clear
+```
+
+**A hibernate lost my session**
+
+```sh
+journalctl --list-boots | tail -3                      # new boot ID = resume failed
+journalctl -b 0 | grep -E "PM: Image (not found|mismatch)"
+journalctl -b 0 | grep "Reported hibernation image"    # which kernel wrote it
+uname -r                                               # which kernel read it
+```
+A `kernel=` differing from `uname -r` is the stale-kernel trap. `Image not found
+(code -22)` on its own means the image write never completed — swsusp writes the
+header signature last, so a partial write leaves no valid signature. If the
+battery also drained heavily, the machine never finished powering off:
+hibernation is 0 W, so **any** measurable drain across one means it hung.
 
 More diagnostics — and the reasoning behind all of it — in
 [framework13-suspend-hibernate.md](framework13-suspend-hibernate.md).
@@ -598,6 +683,14 @@ sudo rm /etc/systemd/system/framework-wakeup-policy.service \
         /etc/systemd/system-sleep/framework-wakeup-policy \
         /usr/local/sbin/framework-wakeup-policy
 sudo systemctl daemon-reload
+
+# stale-kernel lid guard
+sudo systemctl disable --now stale-kernel-lid-guard.service
+sudo rm -f /etc/systemd/system/stale-kernel-lid-guard.service \
+           /etc/kernel/postinst.d/zzz-stale-kernel-lid-guard \
+           /usr/local/sbin/stale-kernel-lid-guard \
+           /run/systemd/logind.conf.d/99-stale-kernel.conf
+sudo systemctl daemon-reload && sudo systemctl reload systemd-logind
 
 # suspend-then-hibernate (keeping plain suspend)
 sudo rm /etc/systemd/logind.conf.d/10-lid-sleep.conf \

@@ -1,0 +1,20 @@
+[Unit]
+Description=Suspend-only lid guard while running a stale kernel
+Documentation=https://github.com/driegert/framework13-suspend_hibernate
+# The kernel postinst hook arms this when apt installs a kernel. This unit
+# covers the other way in: booting an old kernel deliberately from the GRUB
+# menu, where nothing was installed but the running kernel is still stale.
+# logind must exist for the reload to land; if it does not, the drop-in is
+# read when logind starts anyway.
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=oneshot
+# Keeps the unit visible as "active (exited)" in systemctl status so you can
+# confirm it ran. Without it a successful run reports "inactive (dead)".
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/stale-kernel-lid-guard
+
+[Install]
+WantedBy=multi-user.target
