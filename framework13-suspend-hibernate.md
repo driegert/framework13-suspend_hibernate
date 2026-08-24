@@ -17,11 +17,12 @@ non-obvious traps that cost the most time.
 7. [Part 5 — Migrating to a swap partition](#part-5--migrating-to-a-swap-partition)
 8. [Part 6 — A lost session, diagnosed](#part-6--a-lost-session-diagnosed)
 9. [Part 7 — The kernel-upgrade trap](#part-7--the-kernel-upgrade-trap)
-10. [Installed files — full inventory](#installed-files--full-inventory)
-11. [Diagnostic cookbook](#diagnostic-cookbook)
-12. [Gotchas worth remembering](#gotchas-worth-remembering)
-13. [Troubleshooting](#troubleshooting)
-14. [How to undo everything](#how-to-undo-everything)
+10. [Part 8 — A panic during hibernation, and no vmcore](#part-8--a-panic-during-hibernation-and-no-vmcore)
+11. [Installed files — full inventory](#installed-files--full-inventory)
+12. [Diagnostic cookbook](#diagnostic-cookbook)
+13. [Gotchas worth remembering](#gotchas-worth-remembering)
+14. [Troubleshooting](#troubleshooting)
+15. [How to undo everything](#how-to-undo-everything)
 
 ---
 
@@ -977,6 +978,203 @@ did not run.
 
 ---
 
+## Part 8 — A panic during hibernation, and no vmcore
+
+A third lost session, on 2026-08-24. Same outcome as [Part 6](#part-6--a-lost-session-diagnosed)
+and [Part 7](#part-7--the-kernel-upgrade-trap) — desktop gone, machine cold-booted
+— but a **different failure entirely**, and one neither earlier fix could have
+prevented. The cause is still unknown. What this part records is how to
+*recognise* it, why the evidence that would explain it was missing, and the
+change that should preserve that evidence next time.
+
+### Symptom
+
+Lid closed on battery at 11:34. Opened hours later to a fresh login screen.
+No `PM: Image not found`, no `-22`, none of the Part 6/7 signatures.
+
+### Step 1 — read the boot list correctly
+
+```
+-2  aa4ea588…  Sun 2026-08-23 09:23:09  Mon 2026-08-24 13:34:19
+-1  e8949085…  Mon 2026-08-24 13:34:31  Mon 2026-08-24 13:34:31
+ 0  1281bde9…  Mon 2026-08-24 13:35:46  …
+```
+
+**Two** new boot IDs, not one, and the middle one lasts seconds. That middle
+entry is not a boot — it is the **kdump capture kernel**:
+
+```bash
+journalctl -b -1 | grep "Kernel command line"
+# elfcorehdr=0xfde000000 … reset_devices systemd.unit=kdump-tools-dump.service \
+#   nr_cpus=1 irqpoll usbcore.nousb
+```
+
+`elfcorehdr=` is decisive. `kexec -p` fires **only on a panic**, so its presence
+is proof of one — this is the cheapest positive test available, and it needs no
+dump. Read as three ordinary boots, the same evidence looks like a reboot loop
+and misleads completely.
+
+### Step 2 — where the journal stops is *not* where it died
+
+The last line ever persisted from the doomed boot:
+
+```
+13:34:19.110358  systemd-sleep[…]: Performing sleep operation 'hibernate'...
+13:34:19.111257  kernel: PM: hibernation: hibernation entry
+```
+
+It is tempting to conclude it panicked microseconds into hibernation entry.
+**That conclusion is wrong**, and the same boot contains the proof. It had
+already hibernated successfully once that morning, and the entry sequence for
+*that* cycle reads:
+
+```
+10:32:34.060774  kernel: PM: hibernation: hibernation entry
+10:58:03.703109  kernel: Filesystems sync: 0.013 seconds
+10:58:03.713340  kernel: Freezing user space processes
+```
+
+`Filesystems sync` and `Freezing user space processes` describe work done at
+**10:32**, but carry the **10:58 resume timestamp**. journald is frozen moments
+after `hibernation entry`; everything after it accumulates in the kmsg ring and
+only reaches disk **when the machine wakes up**. This is [gotcha 7](#gotchas-worth-remembering)
+taken to its conclusion: a hibernation that never resumes never flushes, so
+**the blind window is the entire hibernation** — notifier chain, device suspend,
+the ~12 GB image write, and power-down are all equally suspect.
+
+Without a vmcore there is nothing further to narrow it with. Which is what makes
+the missing dump the actionable part of this postmortem rather than a footnote.
+
+### Step 3 — the obvious suspect, ruled out
+
+An `apt upgrade` had run **eight minutes** before the lid closed, which after
+Part 7 is exactly the thing to suspect. It was not the cause:
+
+```
+11:26:17  teams-for-linux, microsoft-edge-stable, r-base-core,
+          r-cran-data.table, r-cran-recipes, r-cran-ggfortify
+```
+
+Entirely userspace. Checks that settle it, worth re-running in this order:
+
+```bash
+zgrep -h "^$(date +%F)" /var/log/dpkg.log* | grep -EI 'linux-image|linux-modules|firmware|microcode|systemd'
+stat -c '%y' /lib/modules/$(uname -r)      # unchanged since the last kernel install
+ls /var/run/reboot-required                # absent
+```
+
+No kernel, module, firmware, microcode or systemd package was touched; the
+modules directory was five days old; no reboot was pending; and `7.0.0-30` was
+running before and after. So the Part 7 trap did **not** recur, and
+`stale-kernel-lid-guard` correctly had nothing to arm — an absence of action,
+not a miss.
+
+### Step 4 — one lid close, three hibernations
+
+The counts don't reconcile at first glance, and the reason matters when
+reconstructing a timeline from memory.
+
+| | Event |
+|---|---|
+| 08:32:31 | `Lid closed.` → suspend → hibernate 10:32 → resumed 10:58 ✅ |
+| 11:34:16 | `Lid closed.` → suspend → **hibernate 13:34 → panic** 💥 |
+| 13:36:16 | `Suspending, then hibernating…` — **no `Lid closed.` before it** |
+| 15:36:22 | hibernate → resumed 18:51 on `Lid opened.` ✅ |
+
+The machine rebooted with the lid still shut, so logind saw the *closed state*
+about 24 s after it began watching the switch and re-ran the whole lid policy by
+itself. Net: **two lid closes, three hibernations, two of them successful.**
+
+> Count `Lid closed.` / `Lid opened.` from `systemd-logind` when reconciling
+> against what you actually did. `Performing sleep operation` lines count sleep
+> *attempts*, which a crash-and-reboot can silently inflate.
+
+### Step 5 — why there was no vmcore
+
+kdump was enabled, loaded, and reported `ready to kdump`. `/var/crash` held only
+`kdump_lock` and `kexec_cmd` — no dump directory. The capture kernel's own log
+says why:
+
+```
+systemd-hibernate-resume[246]: Reported hibernation image: … kernel=7.0.0-30-generic
+systemd-hibernate-resume[246]: Successfully cleared HibernateLocation EFI variable
+systemd[1]: Queued start job for default target kdump-tools-dump.service
+```
+
+It went down the **hibernation-resume path** and cleared the EFI hibernate
+pointer, while `kdump-tools-dump.service` never got past *queued*. The cause is
+visible in `kdump-config` itself:
+
+```bash
+sed -n '732p' /usr/sbin/kdump-config
+# KDUMP_CMDLINE=$(sed -re 's/(^| )(crashkernel|hugepages|hugepagesz|abm)=[^ ]*//g;…' /proc/cmdline)
+```
+
+It builds the capture cmdline from `/proc/cmdline`, stripping only
+`crashkernel`, `hugepages`, `hugepagesz` and `abm`. **`resume=` is inherited
+verbatim.** On any machine with hibernation configured, the capture kernel is
+therefore pointed at a swap device that — when the panic happened *during*
+hibernation — holds a half-written image. A crash-capture kernel has no business
+touching it.
+
+### The fix
+
+Append `noresume` to the capture kernel's command line:
+
+```sh
+# /etc/default/kdump-tools
+KDUMP_CMDLINE_APPEND="reset_devices systemd.unit=kdump-tools-dump.service nr_cpus=1 irqpoll usbcore.nousb noresume"
+```
+
+```bash
+sudo kdump-config unload && sudo kdump-config load
+grep noresume /var/crash/kexec_cmd && kdump-config status
+```
+
+`framework13-suspend-scripts/kdump-noresume.sh` does this idempotently, with a
+timestamped backup and a verification pass.
+
+**The trap in this one-liner:** `KDUMP_CMDLINE_APPEND` **replaces** the built-in
+default, it does not extend it —
+
+```bash
+sed -n '60p' /usr/sbin/kdump-config
+# KDUMP_CMDLINE_APPEND=${KDUMP_CMDLINE_APPEND:="reset_devices systemd.unit=… nr_cpus=1 irqpoll usbcore.nousb"}
+```
+
+Setting it to just `"noresume"` silently drops `systemd.unit=kdump-tools-dump.service`
+and kdump stops capturing altogether, while still cheerfully reporting *ready to
+kdump*. All five defaults must be repeated. Verify against `/var/crash/kexec_cmd`,
+never against the config file.
+
+`resume=UUID=…` still *appears* in the capture cmdline — this overrides it rather
+than removing it. That is deliberate and sufficient: the kernel's
+`software_resume()` bails on `noresume` regardless of argument order, and
+systemd's `hibernate-resume-generator` logs *"Found noresume on the kernel
+command line, quitting"* and never generates the unit. Removing it outright would
+need `KDUMP_CMDLINE`, which overrides the *whole* line and then stops tracking
+the real one.
+
+### What this does and does not buy
+
+It does **not** make hibernation more reliable, and it does not prevent the
+panic. If it recurs the session is still lost. What changes is that
+`/var/crash/<timestamp>/` should then contain a `dmesg` and a `vmcore` covering
+precisely the window that is otherwise unrecoverable — turning a fourth
+unexplained loss into something `crash` can be pointed at.
+
+**It is unverified against a real panic.** kdump reports `ready to kdump` from
+having *loaded* an image, which is exactly what it reported before producing
+nothing. The only honest test deliberately crashes the machine:
+
+```bash
+echo c | sudo tee /proc/sysrq-trigger     # HARD CRASH. Save your work first.
+```
+
+Worth doing on purpose at a quiet moment. Never before a lecture.
+
+---
+
 ## Installed files — full inventory
 
 | Path | Purpose |
@@ -992,11 +1190,12 @@ did not run.
 | `/etc/kernel/postinst.d/zzz-stale-kernel-lid-guard` | Evaluates the guard whenever apt installs a kernel. `zzz-` sorts after `zz-update-grub`. |
 | `/run/systemd/logind.conf.d/99-stale-kernel.conf` | **Written at runtime, tmpfs, not installed.** Present only while the guard is armed; gone after a reboot. |
 | `/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf` | Raises the emergency-hibernate battery floor from 2% to 7% (see [Part 6](#part-6--a-lost-session-diagnosed)) |
+| `/etc/default/kdump-tools` | `KDUMP_CMDLINE_APPEND=… noresume` so the crash-capture kernel doesn't walk the hibernation-resume path (see [Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)). Packaged conffile, edited in place; timestamped `.bak-` alongside. |
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
 | `/etc/default/grub` | `resume=UUID=<your-swap-uuid>` appended — **no `resume_offset`**; timestamped `.bak` alongside |
 | `/etc/fstab` | swap entry now `UUID=<your-swap-uuid>`; the old `/swap.img` line commented out, timestamped `.bak` alongside |
 
-**Current verified state** *(2026-08-21)*
+**Current verified state** *(2026-08-24)*
 
 ```
 armed wake sources:  PNP0C0D (lid), PNP0C0C (power button), pnp0/00:00 + rtc0/alarmtimer
@@ -1007,6 +1206,8 @@ swap                     = 64 G at /dev/nvme0n1p5, contiguous
 UPower PercentageAction  = 7.0            (packaged default 2.0)
 CanSuspend / CanHibernate / CanSuspendThenHibernate = yes / yes / yes
 stale-kernel lid guard   = installed, enabled, self-test PASS, not armed
+kdump                    = ready to kdump; capture cmdline carries noresume
+                           (UNVERIFIED against a real panic -- see Part 8)
 WiFi                     = Intel AX210 (iwlwifi), ~4 s to activated after resume
 ```
 
@@ -1083,6 +1284,16 @@ busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
 # Effective merged config
 systemd-analyze cat-config systemd/sleep.conf
 systemd-analyze cat-config systemd/logind.conf
+
+# DID IT PANIC?  A short extra boot whose cmdline has elfcorehdr= is the
+# kdump capture kernel, and kexec -p fires ONLY on a panic. Not a reboot loop.
+journalctl --list-boots | tail -4
+journalctl -b -1 | grep "Kernel command line"
+
+# Is crash capture actually armed, and pointed away from the swap device?
+kdump-config status
+grep noresume /var/crash/kexec_cmd     # verify HERE, not in /etc/default/kdump-tools
+ls -la /var/crash/                     # dated dir = a dump was captured
 ```
 
 ---
@@ -1181,6 +1392,26 @@ systemd-analyze cat-config systemd/logind.conf
         org.freedesktop.login1.Manager HandleLidSwitch
     ```
 
+16. **A hibernation that never resumes flushes *nothing*.** [Gotcha 7](#gotchas-worth-remembering)
+    says kernel PM messages are timestamped at resume; the consequence is that if
+    there is no resume, every message after `PM: hibernation: hibernation entry`
+    dies in the ring buffer. **The last journal line is where logging stopped, not
+    where the kernel stopped.** Proof, from a *successful* cycle: its
+    `Filesystems sync` and `Freezing user space processes` lines carry the
+    **resume** timestamp, 25 minutes after the entry they describe. Treat the
+    whole hibernation as the blind window and get a vmcore
+    ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)).
+
+17. **The kdump capture kernel inherits `resume=` from `/proc/cmdline`.**
+    `kdump-config` strips only `crashkernel`, `hugepages`, `hugepagesz` and `abm`
+    (line 732), so on any hibernation-configured machine the capture kernel is
+    aimed at the swap device — and if the panic happened *during* hibernation,
+    at a half-written image. It ran `systemd-hibernate-resume` and cleared the
+    EFI `HibernateLocation` variable instead of saving a dump. Fixed with
+    `noresume` in `KDUMP_CMDLINE_APPEND`, which **replaces** the packaged default
+    rather than extending it (line 60) — repeat all five options or kdump silently
+    stops capturing while still reporting *ready to kdump*.
+
 ---
 
 ## Troubleshooting
@@ -1208,6 +1439,21 @@ stale-kernel-lid-guard --status     # "ARMED" = working as intended; reboot to c
 Expected right after a kernel upgrade. If it says ARMED and you have already
 rebooted, the `/run` file should have vanished — check
 `systemctl status stale-kernel-lid-guard.service`.
+
+**Session lost, and the journal just stops at `hibernation entry`**
+```bash
+journalctl --list-boots | tail -4                  # TWO new boot IDs = a panic
+journalctl -b -1 | grep "Kernel command line"      # elfcorehdr= -> capture kernel
+ls -la /var/crash/                                 # dated dir = dump captured
+```
+This is [Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore), not a Part 6/7
+image failure — there will be no `-22` and no `Image mismatch`. Do **not** read the
+last journal line as the point of death ([gotcha 16](#gotchas-worth-remembering)).
+If `/var/crash` has no dated directory, capture is broken; check
+`grep noresume /var/crash/kexec_cmd` before anything else. A reboot with the lid
+still shut re-runs the lid policy on its own, so the hibernate count can exceed
+the number of times you actually closed it — count `Lid closed.` from
+`systemd-logind`.
 
 **Session lost across a hibernate**
 ```bash
@@ -1297,6 +1543,15 @@ sudo systemctl reload systemd-logind
 Removing it restores the old behaviour: hibernating on a stale kernel silently
 loses the session.
 
+**kdump `noresume`**
+```bash
+sudo cp -a /etc/default/kdump-tools.bak-<timestamp> /etc/default/kdump-tools
+sudo kdump-config unload && sudo kdump-config load
+grep -c noresume /var/crash/kexec_cmd    # expect 0
+```
+Reverting restores the packaged behaviour, in which a panic during hibernation
+produces no usable dump.
+
 **suspend-then-hibernate (keep plain suspend)**
 ```bash
 sudo rm /etc/systemd/logind.conf.d/10-lid-sleep.conf \
@@ -1339,14 +1594,28 @@ back from a live USB.
 - **Re-run `--self-test` after any systemd major-version upgrade.** The guard
   rests on drop-in filename ordering and on logind honouring a reload; both are
   stable, neither is a promise. The test is non-destructive and takes a second.
+- **Crash capture is armed but unproven.** `kdump-config status` reporting
+  *ready to kdump* only means an image was loaded — it reported exactly that
+  before capturing nothing on 2026-08-24. The only real test is
+  `echo c | sudo tee /proc/sysrq-trigger`, which hard-crashes the machine. Do it
+  deliberately, never before a lecture, and expect a dated directory under
+  `/var/crash` afterwards.
+- **Check `/var/crash` after any unexplained cold boot**, and re-check
+  `grep noresume /var/crash/kexec_cmd` after a `kdump-tools` package upgrade — the
+  setting lives in a packaged conffile, so an upgrade may prompt to replace it.
 - **If the WiFi card is swapped again, re-measure the resume time**
   ([gotcha 8](#gotchas-worth-remembering)) — it's a driver property, not a
   hibernate one.
 
 ---
 
-*Last updated 2026-08-21. Nothing outstanding. Verified on the swap partition:
-manual `systemctl hibernate`, a full 2 h lid-closed suspend-then-hibernate
-cycle, and a 16 h 55 m overnight hibernation that resumed into the same boot ID
-at a cost of well under 1% of the battery. The stale-kernel lid guard is
-installed, enabled, and passes its self-test.*
+*Last updated 2026-08-24. **One thing outstanding:** an unexplained kernel panic
+during hibernation on 2026-08-24 ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore))
+— two of three hibernations that day succeeded, the third panicked, and the cause
+is unknown because crash capture was silently broken. That has been fixed with
+`noresume`, but the fix is unverified against a real panic and the underlying
+fault may recur. Everything else remains verified on the swap partition: manual
+`systemctl hibernate`, a full 2 h lid-closed suspend-then-hibernate cycle, and a
+16 h 55 m overnight hibernation that resumed into the same boot ID at a cost of
+well under 1% of the battery. The stale-kernel lid guard is installed, enabled,
+and passes its self-test.*
