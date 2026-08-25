@@ -126,12 +126,13 @@ grep noresume /var/crash/kexec_cmd
 ```
 
 `/etc/default/kdump-tools` is a packaged conffile, so a `kdump-tools` upgrade may
-offer to replace it — re-check after one. Note that crash capture here has
-**never yet produced a vmcore**: the capture kernel panicked on its own device
-probing on both 2026-08-24 (`snd_pci_ps`) and 2026-08-25 (`iwlwifi`). The
-blacklist targets exactly those; a third driver may still be waiting. Proving it
-means `echo c | sudo tee /proc/sysrq-trigger`, which hard-crashes the machine,
-then checking **both** `/var/crash` and `/var/lib/systemd/pstore/`.
+offer to replace it — re-check after one. Crash capture had **never** produced a
+vmcore here until this was fixed: the capture kernel panicked on its own device
+probing on 2026-08-24 (`snd_pci_ps`) and 2026-08-25 (`iwlwifi`). **Verified
+working 2026-08-25** — a deliberate `echo c | sudo tee /proc/sysrq-trigger`
+produced a 456 MB vmcore *and* a pstore dmesg of the real panic. Re-prove after
+any kernel or `kdump-tools` upgrade, checking **both** `/var/crash` and
+`/var/lib/systemd/pstore/`.
 
 See "A panic during hibernation, and no vmcore" in
 `../framework13-suspend-hibernate.md`.

@@ -1210,23 +1210,56 @@ panic. If it recurs the session is still lost. What changes is that the next one
 should leave a readable dmesg in `/var/lib/systemd/pstore/` naming the driver —
 which is all that was ever needed to stop calling this "unexplained".
 
-Honest status of each half:
+### Verified 2026-08-25 — both halves, against a real panic
 
-| | Verified? |
-|---|---|
-| `crash_kexec_post_notifiers` ordering | Mechanism proven by the 08-24 empty-pstore evidence; **the fix itself is unverified against a real panic** |
-| `module_blacklist` making a vmcore appear | **Unverified.** Two capture-kernel panics in two attempts, both now blacklisted, but a third driver may be waiting |
-| `noresume` | Verified to work, and verified *not* to be the fix |
+A second deliberate crash, `echo c > /proc/sysrq-trigger` at 13:08:52, after both
+changes. **Both mechanisms produced evidence.**
 
-The test that settles it deliberately crashes the machine:
+**A vmcore, for the first time on this machine:**
 
-```bash
-echo c | sudo tee /proc/sysrq-trigger     # HARD CRASH. Save your work first.
+```
+/var/crash/202608251309/
+  dmesg.202608251309    151 KB
+  dump.202608251309     456 MB
+kdump-tools: makedumpfile Completed.
+kdump-tools: saved vmcore in /var/crash/202608251309
 ```
 
-Afterwards expect a dated directory under `/var/crash` (vmcore — the ambitious
-outcome) **and/or** a fresh record in `/var/lib/systemd/pstore/` (dmesg — the one
-that actually matters). Getting only the second is still a win.
+The capture kernel lived **19 s** (13:09:26 → 13:09:45) and did its job, versus
+dying at 10 s and 32 s on the two previous attempts. `Module iwlwifi is
+blacklisted` appears in its log; no Oops, no panic.
+
+**And pstore caught the *real* panic, not the capture kernel:**
+
+```
+1787677733  kernel uptime 5435.5 .. 7497.7 s
+              sysrq: Trigger a crash
+              Kernel panic - not syncing: sysrq triggered crash
+```
+
+`7497 s` is the decisive number. Every earlier pstore record had an uptime of
+**10–35 seconds**, because it was written by the capture kernel as it died. This
+one was written by the kernel that panicked, before the kexec jump — which is
+exactly what `crash_kexec_post_notifiers=1` exists to do.
+
+| | Status |
+|---|---|
+| `crash_kexec_post_notifiers` ordering | **VERIFIED** against a real panic |
+| `module_blacklist` → capture kernel survives → vmcore | **VERIFIED** against a real panic |
+| `noresume` | Verified to work, and verified *not* to be the fix |
+
+Caveat worth keeping: this was a `sysrq` panic on a healthy running system. A
+panic *during hibernation* happens with tasks frozen and devices half-suspended,
+which is a harder case for the capture kernel. The belt-and-braces design is the
+point — if the capture kernel dies in that situation, pstore still has the dmesg.
+
+> **Reading the uptime is the whole trick, and there is a trap in it.** Kernel
+> printk timestamps come from the monotonic clock, which **does not advance
+> during s2idle**. Here: 15194 s of wall clock, 7497 s on the kernel clock, and
+> the 7697 s difference matches the logged suspend segments
+> (7198.217 + 493.373 + 3.974 = 7695.6 s) to within rounding. Never convert a
+> printk timestamp to wall-clock on a laptop that suspends — compare it against
+> *other* printk timestamps instead.
 
 > **If you take one thing from Part 8:** check `/var/lib/systemd/pstore/`, not
 > `/sys/fs/pstore`. The latter is root-only and returns *permission denied*,
@@ -1267,10 +1300,11 @@ UPower PercentageAction  = 7.0            (packaged default 2.0)
 CanSuspend / CanHibernate / CanSuspendThenHibernate = yes / yes / yes
 stale-kernel lid guard   = installed, enabled, self-test PASS, not armed
 kdump                    = ready to kdump; capture cmdline carries noresume
-                           + module_blacklist. Capture has NEVER yet produced a
-                           vmcore -- it panicked itself on 08-24 and 08-25.
-crash_kexec_post_notifiers = Y  (so efi_pstore records a panic even if the
-                           capture kernel dies; UNVERIFIED against a real panic)
+                           + module_blacklist. VERIFIED 2026-08-25: saved a
+                           456 MB vmcore to /var/crash/202608251309.
+crash_kexec_post_notifiers = Y  (efi_pstore records the panic BEFORE the kexec
+                           jump). VERIFIED 2026-08-25: pstore record at kernel
+                           uptime 7497 s = the real kernel, not the capture one.
 WiFi                     = Intel AX210 (iwlwifi), ~4 s to activated after resume
 ```
 
@@ -1505,6 +1539,18 @@ ls -la /var/crash/                     # dated dir = a vmcore was captured
     `note_interrupt` → `try_one_irq` → `acp63_irq_handler`). A capture kernel
     needs `nvme` and the root filesystem and nothing else — blacklist the rest.
 
+20. **printk timestamps do not advance during suspend.** They come from the
+    monotonic clock, which s2idle pauses — so on a laptop that suspends, kernel
+    log timestamps and wall-clock time diverge without warning. Measured here on
+    2026-08-25: 15194 s wall, 7497 s on the kernel clock, difference 7697 s,
+    matching the sum of that boot's `Timekeeping suspended` segments (7695.6 s).
+    This is what makes uptime a reliable way to tell a **capture kernel** record
+    (10–35 s) from a **real kernel** one (thousands) in
+    [Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore) — but it also
+    means you cannot map a printk timestamp back to a clock time. Distinct from
+    [gotcha 7](#gotchas-worth-remembering), which is about *when messages are
+    flushed*; this is about *what the numbers in them mean*.
+
 ---
 
 ## Troubleshooting
@@ -1689,12 +1735,13 @@ back from a live USB.
 - **Re-run `--self-test` after any systemd major-version upgrade.** The guard
   rests on drop-in filename ordering and on logind honouring a reload; both are
   stable, neither is a promise. The test is non-destructive and takes a second.
-- **Crash capture is armed but has never produced a vmcore.** `kdump-config
-  status` reporting *ready to kdump* only means an image was loaded — it reported
-  exactly that before capturing nothing on both 2026-08-24 and 2026-08-25. The
-  real test is `echo c | sudo tee /proc/sysrq-trigger`, which hard-crashes the
-  machine. Do it deliberately, never before a lecture, and afterwards check
-  **both** `/var/crash` (vmcore) and `/var/lib/systemd/pstore/` (dmesg).
+- **Crash capture works, and was proven on 2026-08-25** (456 MB vmcore + a
+  pstore dmesg of the real panic). Note `kdump-config status` reporting *ready to
+  kdump* is NOT evidence of that — it reported exactly the same thing while
+  capturing nothing on 08-24 and earlier on 08-25. Re-prove with
+  `echo c | sudo tee /proc/sysrq-trigger` after any kernel or `kdump-tools`
+  upgrade, and check **both** `/var/crash` and `/var/lib/systemd/pstore/`.
+- **Dumps are ~456 MB each and `KDUMP_NUM_DUMPS=3`**, so budget ~1.4 GB of `/`.
 - **`crash_kexec_post_notifiers` must read `Y`** — that is what makes a panic
   reach `pstore` at all while kdump is armed. It is set on the GRUB cmdline and
   is also live-togglable, so a config drift shows up at runtime:
@@ -1710,12 +1757,14 @@ back from a live USB.
 
 *Last updated 2026-08-25. **One thing outstanding:** an unexplained kernel panic
 during hibernation on 2026-08-24 ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore))
-— two of three hibernations that day succeeded, the third panicked, and the cause
-is still unknown. A deliberate `sysrq` crash on 08-25 proved the capture kernel
-panics on its own device probing, and that kdump had been pre-empting `pstore`,
-so neither mechanism had ever recorded anything. Both are now addressed
-(`crash_kexec_post_notifiers=1`, plus a capture-kernel module blacklist) and
-both remain unverified against a real panic. Everything else remains verified on the swap partition: manual
+— two of three hibernations that day succeeded, the third panicked, and **the
+cause is still unknown**. Diagnosis had been blocked by two separate failures:
+the kdump capture kernel was panicking on its own device probing, and kdump was
+pre-empting `pstore`, so neither mechanism ever recorded anything. Both are fixed
+(`crash_kexec_post_notifiers=1` plus a capture-kernel module blacklist) and
+**both were verified against a real panic on 2026-08-25** — a 456 MB vmcore and a
+pstore dmesg of the crashing kernel itself. The next hibernation panic should
+name its driver. Everything else remains verified on the swap partition: manual
 `systemctl hibernate`, a full 2 h lid-closed suspend-then-hibernate cycle, and a
 16 h 55 m overnight hibernation that resumed into the same boot ID at a cost of
 well under 1% of the battery. The stale-kernel lid guard is installed, enabled,

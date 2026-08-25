@@ -271,10 +271,16 @@ sudo ./crash-evidence-setup.sh
 ls /var/lib/systemd/pstore/     # NOT /sys/fs/pstore, which is root-only
 ```
 
-Be honest about what this buys: it does not make hibernation more reliable, and
-**neither half is verified against a real panic**. A third capture-kernel driver
-crash is entirely possible. What it should guarantee is a readable dmesg naming
-the driver, which is usually all you need.
+**Verified 2026-08-25** with a deliberate `echo c > /proc/sysrq-trigger`: the
+capture kernel survived 19 s and wrote a 456 MB vmcore, *and* pstore recorded the
+real panic (kernel uptime 7497 s — earlier records, written by the dying capture
+kernel, all showed 10–35 s).
+
+Be honest about what this buys: it does not make hibernation more reliable. And
+the test was a `sysrq` panic on a healthy system — a panic during hibernation,
+with tasks frozen and devices half-suspended, is a harder case for the capture
+kernel. That is why both halves are worth having: if the capture kernel dies
+there, pstore still holds a dmesg naming the driver.
 
 ### Part 4 — `suspend-report`
 
@@ -791,7 +797,8 @@ Wake sources return to kernel defaults on the next reboot.
   short and carrying `elfcorehdr=` on its command line — that is the kdump
   capture kernel, and `kexec -p` fires only on a panic. Cause still unknown: no
   vmcore was produced (the capture kernel panicked too) and no dmesg either
-  (kdump had pre-empted pstore). Both are addressed in Part 6, neither is proven.
+  (kdump had pre-empted pstore). Both are fixed in Part 6 and verified 08-25, so
+  a recurrence should finally name its driver.
   Note that a hibernation which never resumes flushes **nothing** to the journal
   after `hibernation entry`, so the last logged line is where logging stopped,
   not where the kernel stopped.
