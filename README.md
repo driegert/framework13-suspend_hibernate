@@ -114,7 +114,8 @@ nodes). If it reports 20-something today, this repo is for you.
 | `stale-kernel-lid-guard` | `/usr/local/sbin/` (0755) | ✅ as-is |
 | `stale-kernel-lid-guard.service` | `/etc/systemd/system/` (0644) | ✅ as-is |
 | `zzz-stale-kernel-lid-guard` | `/etc/kernel/postinst.d/` (0755) | ⚠️ Debian/Ubuntu kernel hooks |
-| `kdump-noresume.sh` | run once with sudo, not installed | ⚠️ only if you use kdump |
+| `crash-evidence-setup.sh` | run once with sudo, not installed | ⚠️ only if you use kdump |
+| `kdump-noresume.sh` | superseded by the above | — |
 | `suspend-report` | `~/.local/bin/` (0755) | ⚠️ edit battery model |
 
 All of it lives in [`framework13-suspend-scripts/`](framework13-suspend-scripts/).
@@ -237,34 +238,43 @@ The self-test exists because the guard only fires during rare events; it reads
 the effective lid action back from logind over D-Bus rather than trusting the
 file it just wrote, then restores normal state.
 
-### Part 6 — `kdump-noresume.sh`
+### Part 6 — `crash-evidence-setup.sh`
 
-Only relevant if you run `kdump` — but if you do, and you hibernate, crash
-capture is quietly broken in a way that matters most on exactly the crash you'd
-want it for.
+Only relevant if you run `kdump` — but if you do, there is a trap worth knowing
+about even if you never touch this script.
 
-`kdump-config` builds the capture kernel's command line from `/proc/cmdline`,
-stripping only `crashkernel`, `hugepages`, `hugepagesz` and `abm`. **`resume=` is
-inherited.** So the crash-capture kernel is pointed at your swap device — and if
-the panic happened *during* hibernation, at a half-written image. Here it ran
-`systemd-hibernate-resume` against that image and cleared the EFI
-`HibernateLocation` variable, while `kdump-tools-dump.service` never got past
-*queued*. A panic during hibernation, and no vmcore.
+**Enabling kdump can leave you with *less* crash evidence than not enabling it.**
+`panic()` calls `__crash_kexec()` before `kmsg_dump()`, and the jump to the
+capture kernel never returns — so with kdump armed, `efi_pstore` records nothing.
+You are then relying entirely on the capture kernel succeeding. Here it did not:
+it panicked on its own device probing, twice, in two different drivers
+(`acp63_irq_handler [snd_pci_ps]` at 10 s, `iwlwifi` → `RIP: 0x0` at 32 s). Net
+result: a kernel panic that left no vmcore *and* no dmesg.
 
-The script appends `noresume` to `KDUMP_CMDLINE_APPEND`. The trap it exists to
-avoid: that variable **replaces** the packaged default rather than extending it,
-so setting it to just `"noresume"` drops
-`systemd.unit=kdump-tools-dump.service` and stops capture entirely — while
-`kdump-config status` still reports *ready to kdump*.
+The script sets two things:
+
+- **`crash_kexec_post_notifiers=1`** on the main kernel cmdline, so `kmsg_dump()`
+  runs *before* the kexec jump and the panic reaches `pstore` regardless. This is
+  the one that matters. It is also live-togglable, so you can arm it without
+  rebooting:
+  ```sh
+  echo Y | sudo tee /sys/module/kernel/parameters/crash_kexec_post_notifiers
+  ```
+- **`module_blacklist=…`** on the capture kernel cmdline. A capture kernel needs
+  `nvme` and your root filesystem; it does not need audio, WiFi, the GPU or
+  Thunderbolt. `irqpoll` — which kdump adds by default — makes this sharper by
+  polling *every* registered IRQ handler, so an uninitialised driver gets called
+  anyway.
 
 ```sh
-sudo ./kdump-noresume.sh              # idempotent, backs up, verifies
-grep noresume /var/crash/kexec_cmd    # verify HERE, not in /etc/default
+sudo ./crash-evidence-setup.sh
+ls /var/lib/systemd/pstore/     # NOT /sys/fs/pstore, which is root-only
 ```
 
-Two things to be honest about: this does not make hibernation more reliable, and
-it is **unverified against a real panic** — proving it means
-`echo c | sudo tee /proc/sysrq-trigger`, which hard-crashes the machine.
+Be honest about what this buys: it does not make hibernation more reliable, and
+**neither half is verified against a real panic**. A third capture-kernel driver
+crash is entirely possible. What it should guarantee is a readable dmesg naming
+the driver, which is usually all you need.
 
 ### Part 4 — `suspend-report`
 
@@ -571,17 +581,19 @@ The self-test must report `PASS`. It arms the guard, confirms logind actually
 switched the lid action to `suspend`, clears it, and confirms it switched back —
 leaving the system in whatever state the real check calls for.
 
-### Step 6 — crash capture, if you use kdump
+### Step 6 — crash evidence, if you use kdump
 
 Skip unless `kdump-config status` reports *ready to kdump*.
 
 ```sh
-sudo "$D/kdump-noresume.sh"
+sudo "$D/crash-evidence-setup.sh"
 ```
 
-It refuses to run if `KDUMP_CMDLINE_APPEND` is already set, takes a timestamped
-backup, reloads the kexec image, and then checks that `noresume` reached
-`/var/crash/kexec_cmd` **and** that all five packaged defaults survived.
+Idempotent, takes timestamped backups of both files it edits, regenerates grub,
+reloads the kexec image, and verifies every option it touched against
+`/var/crash/kexec_cmd` and `/boot/grub/grub.cfg` rather than against the config
+files. The pstore ordering fix is armed at runtime too, so it is in effect before
+you reboot.
 
 ---
 
@@ -734,8 +746,10 @@ sudo rm -f /etc/systemd/system/stale-kernel-lid-guard.service \
            /run/systemd/logind.conf.d/99-stale-kernel.conf
 sudo systemctl daemon-reload && sudo systemctl reload systemd-logind
 
-# kdump noresume (restores the packaged conffile)
+# crash evidence (restores both packaged conffiles)
 sudo cp -a /etc/default/kdump-tools.bak-<timestamp> /etc/default/kdump-tools
+sudo cp -a /etc/default/grub.bak.<timestamp> /etc/default/grub
+sudo update-grub
 sudo kdump-config unload && sudo kdump-config load
 
 # suspend-then-hibernate (keeping plain suspend)
@@ -775,10 +789,12 @@ Wake sources return to kernel defaults on the next reboot.
   panicked entering hibernation (two of three hibernations that day succeeded).
   The tell is *two* new boot IDs where you expected a resume, the middle one
   short and carrying `elfcorehdr=` on its command line — that is the kdump
-  capture kernel, and `kexec -p` fires only on a panic. Cause unknown: no vmcore
-  was produced, for the reason Part 6 fixes. Note that a hibernation which never
-  resumes flushes **nothing** to the journal after `hibernation entry`, so the
-  last logged line is where logging stopped, not where the kernel stopped.
+  capture kernel, and `kexec -p` fires only on a panic. Cause still unknown: no
+  vmcore was produced (the capture kernel panicked too) and no dmesg either
+  (kdump had pre-empted pstore). Both are addressed in Part 6, neither is proven.
+  Note that a hibernation which never resumes flushes **nothing** to the journal
+  after `hibernation entry`, so the last logged line is where logging stopped,
+  not where the kernel stopped.
 - **`/` needs room.** A 32 GB swapfile left ~22 GB free on a 95 GB root
   partition here. Keep an eye on snaps and `/var`.
 - Machine-specific UUIDs in the documentation are placeholders

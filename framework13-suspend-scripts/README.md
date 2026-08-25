@@ -22,7 +22,8 @@ without root — diff them if you want to be sure).
 | `stale-kernel-lid-guard.service` | `/etc/systemd/system/` (0644) |
 | `zzz-stale-kernel-lid-guard` | `/etc/kernel/postinst.d/` (0755) |
 | `suspend-report` | `~/.local/bin/` (0755) |
-| `kdump-noresume.sh` | run once with sudo; not installed. Edits `/etc/default/kdump-tools`. |
+| `crash-evidence-setup.sh` | run once with sudo; not installed. Edits `/etc/default/grub` + `/etc/default/kdump-tools`. |
+| `kdump-noresume.sh` | **superseded** by the above; kept for reference |
 | `setup-hibernate.sh` | run once with sudo; not installed |
 
 ## Reinstall from scratch
@@ -64,9 +65,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now stale-kernel-lid-guard.service
 sudo /usr/local/sbin/stale-kernel-lid-guard --self-test    # must print PASS
 
-# 7. crash capture: stop the kdump kernel inheriting resume= and walking the
-#    hibernation-resume path instead of saving a vmcore (see Part 8)
-sudo "$D/kdump-noresume.sh"          # idempotent; verifies /var/crash/kexec_cmd
+# 7. make a panic leave evidence: pstore-before-kexec ordering, plus keeping the
+#    capture kernel away from the drivers that have twice panicked it (Part 8)
+sudo "$D/crash-evidence-setup.sh"    # idempotent; verifies everything it changes
 
 # 8. health check
 install -m 0755 "$D/suspend-report" ~/.local/bin/suspend-report
@@ -99,10 +100,24 @@ stale-kernel-lid-guard --status
 
 See "The kernel-upgrade trap" in `../framework13-suspend-hibernate.md`.
 
+**Check `/var/lib/systemd/pstore/`, never `/sys/fs/pstore`.** The latter is
+root-only; `ls` prints *permission denied* and nothing else, which reads exactly
+like "no crash records". The archived copies with reassembled `dmesg.txt` files
+are what you want. And a record whose kernel uptime is *seconds* was written by
+the kdump capture kernel, not by the kernel you care about.
+
+**`crash_kexec_post_notifiers` must be `Y`.** With kdump armed, `panic()` jumps
+to the capture kernel before `kmsg_dump()` runs, so pstore records nothing —
+enabling kdump is a net loss until this is set.
+
+```sh
+cat /sys/module/kernel/parameters/crash_kexec_post_notifiers
+```
+
 **`KDUMP_CMDLINE_APPEND` replaces the packaged default — it does not extend it.**
 Setting it to just `"noresume"` silently drops
 `systemd.unit=kdump-tools-dump.service` and kdump stops capturing entirely, while
-`kdump-config status` still reports *ready to kdump*. `kdump-noresume.sh` repeats
+`kdump-config status` still reports *ready to kdump*. `crash-evidence-setup.sh` repeats
 all five defaults and then checks each one survived. Verify against the built
 command line, never the config file:
 
@@ -111,9 +126,12 @@ grep noresume /var/crash/kexec_cmd
 ```
 
 `/etc/default/kdump-tools` is a packaged conffile, so a `kdump-tools` upgrade may
-offer to replace it — re-check after one. Note the fix is **unverified against a
-real panic**; proving it means `echo c | sudo tee /proc/sysrq-trigger`, which
-hard-crashes the machine.
+offer to replace it — re-check after one. Note that crash capture here has
+**never yet produced a vmcore**: the capture kernel panicked on its own device
+probing on both 2026-08-24 (`snd_pci_ps`) and 2026-08-25 (`iwlwifi`). The
+blacklist targets exactly those; a third driver may still be waiting. Proving it
+means `echo c | sudo tee /proc/sysrq-trigger`, which hard-crashes the machine,
+then checking **both** `/var/crash` and `/var/lib/systemd/pstore/`.
 
 See "A panic during hibernation, and no vmcore" in
 `../framework13-suspend-hibernate.md`.

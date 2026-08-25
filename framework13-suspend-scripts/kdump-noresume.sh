@@ -1,6 +1,11 @@
 #!/bin/bash
 # Add `noresume` to the kdump capture kernel's command line.
 #
+# SUPERSEDED by crash-evidence-setup.sh, which sets this AND the two changes that
+# actually matter. `noresume` is correct and harmless but was NOT what was
+# breaking crash capture -- a deliberate sysrq crash on 2026-08-25 reproduced the
+# failure with noresume in place. Kept for reference; run the other script.
+#
 # Why: kdump-config builds the capture cmdline from /proc/cmdline, stripping only
 # crashkernel/hugepages/hugepagesz/abm (kdump-config:732). `resume=UUID=...` is
 # therefore inherited, so on a hibernation-configured machine the crash-capture
