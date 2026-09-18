@@ -4,7 +4,7 @@ Scripts and config to stop a Framework 13 (AMD Ryzen 7840U) draining its
 battery while it's supposed to be asleep, on Ubuntu.
 
 Developed on a Framework 13 AMD / Ryzen 7 7840U running Ubuntu 26.04, kernel
-7.0.0-30, systemd 259, GNOME/Wayland. Most of it applies to any AMD Framework;
+7.0.0-30 (now 7.0.0-31), systemd 259, GNOME/Wayland. Most of it applies to any AMD Framework;
 the parts that don't are called out in [Portability](#portability).
 
 **Result on the test machine:**
@@ -117,6 +117,7 @@ nodes). If it reports 20-something today, this repo is for you.
 | `crash-evidence-setup.sh` | run once with sudo, not installed | ⚠️ only if you use kdump |
 | `kdump-noresume.sh` | superseded by the above | — |
 | `suspend-report` | `~/.local/bin/` (0755) | ⚠️ edit battery model |
+| `ttm-fix-check` + `.service` + `.timer` | `~/.local/bin/`, `~/.config/systemd/user/` | ⚠️ Ubuntu changelog URLs; edit `PKG` for a non-HWE kernel |
 
 All of it lives in [`framework13-suspend-scripts/`](framework13-suspend-scripts/).
 
@@ -281,6 +282,55 @@ the test was a `sysrq` panic on a healthy system — a panic during hibernation,
 with tasks frozen and devices half-suspended, is a harder case for the capture
 kernel. That is why both halves are worth having: if the capture kernel dies
 there, pstore still holds a dmesg naming the driver.
+
+**Proven against a real hibernation panic on 2026-09-17**: both a pstore dmesg
+of the hibernating kernel and a vmcore. The driver was `acp63_irq_handler
+[snd_pci_ps]` (AMD ACP audio) — the same one that had killed the capture kernel
+in August, now caught doing it in the main kernel.
+
+**But there is a second trap, and this script does not fix it yet.** The
+capture kernel is a full boot: it processes `/etc/fstab`, activates swap, and
+util-linux `swapon` overwrites any hibernation signature it finds
+(`software suspend data detected. Rewriting the swap signature.`). `noresume`
+does not prevent this. So if the panic happens *after* the image is written —
+as it did on 09-17 — kdump destroys a resumable image, and the next boot
+cold-starts. The proposed fix is `systemd.mask=swap.target` (or `fstab=no`) on
+the capture cmdline; it is documented in Part 10 of the write-up and has not
+been verified on this machine. If you don't need vmcores, `crash_kexec_post_notifiers=1`
+*without* kdump avoids the trap entirely and still gets you the pstore dmesg.
+
+### Part 7 — `ttm-fix-check`
+
+Not a sleep fix — a watch for a kernel bug that turns a *successful* hibernation
+resume into a lockup minutes to hours later, on AMD APUs running Ubuntu kernels
+`7.0.0-28` and later (upstream drm/ttm: buffers swapped out for the image are
+never removed from their bulk-move range; freeing one after resume leaves a
+dangling cursor; the next GPU submission faults). Fix queued upstream
+2026-09-09, not shipped as of 2026-09-18. Details and the evidence in Part 9 of
+the write-up.
+
+Until it ships, the only prevention is **reboot after any hibernation resume**
+before doing anything you'd mind losing. This script tells you when to stop:
+
+```sh
+ttm-fix-check
+# running   7.0.0-31.31    buggy
+# candidate 7.0.0-31.31    buggy
+# No fix yet — keep rebooting before class.
+```
+
+It fetches the Ubuntu changelog for the running kernel and the apt candidate,
+classifies each as *clean / buggy / fixed* by commit title, and sends a desktop
+notification once when a fixed kernel becomes available and once when it is the
+one running. The timer runs it daily. Ubuntu-specific (changelog URLs and
+package name); adapt `PKG` if you are not on the HWE kernel.
+
+Also worth knowing: the tell that a session is already in the danger state is
+```sh
+journalctl -b -k | grep -E 'Hibernation image restored|list_del corruption'
+```
+— the first line means "this session came from an image", the second means
+"the corruption has already happened; save your work and reboot now".
 
 ### Part 4 — `suspend-report`
 
@@ -601,6 +651,17 @@ reloads the kexec image, and verifies every option it touched against
 files. The pstore ordering fix is armed at runtime too, so it is in effect before
 you reboot.
 
+### Step 7 — the drm/ttm bug watch (AMD, Ubuntu kernels ≥ 7.0.0-28)
+
+```sh
+install -m 0755 "$D/ttm-fix-check" ~/.local/bin/ttm-fix-check
+install -D -m 0644 "$D/ttm-fix-check.service" ~/.config/systemd/user/
+install -D -m 0644 "$D/ttm-fix-check.timer"   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ttm-fix-check.timer
+ttm-fix-check          # "buggy" = reboot after every hibernation resume, for now
+```
+
 ---
 
 ## What you get, day to day
@@ -611,6 +672,7 @@ you reboot.
 - Waking → **power button or lid only**; keyboard and touchpad won't
 - Unplugging the charger no longer wakes it
 - A kernel installed but not yet booted → lid closed **plain-suspends** until you reboot
+- Resumed from a hibernation image → **reboot before doing anything that matters**, until `ttm-fix-check` says `fixed` (Part 7)
 
 ---
 
@@ -791,17 +853,26 @@ Wake sources return to kernel defaults on the next reboot.
   stayed awake. With the lid already shut, no new lid event arrives and the only
   backstop is GNOME's 30-minute inactivity timeout. That's the failure mode to
   know about; it hasn't recurred in five subsequent cycles.
-- **Hibernation here has panicked once, unexplained.** On 2026-08-24 the machine
-  panicked entering hibernation (two of three hibernations that day succeeded).
-  The tell is *two* new boot IDs where you expected a resume, the middle one
-  short and carrying `elfcorehdr=` on its command line — that is the kdump
-  capture kernel, and `kexec -p` fires only on a panic. Cause still unknown: no
-  vmcore was produced (the capture kernel panicked too) and no dmesg either
-  (kdump had pre-empted pstore). Both are fixed in Part 6 and verified 08-25, so
-  a recurrence should finally name its driver.
-  Note that a hibernation which never resumes flushes **nothing** to the journal
-  after `hibernation entry`, so the last logged line is where logging stopped,
-  not where the kernel stopped.
+- **Hibernation here has panicked twice, in the AMD audio driver.** On
+  2026-08-24 and again on 2026-09-17 the machine panicked in
+  `acp63_irq_handler [snd_pci_ps]` during the device-suspend step after the
+  image was written. The tell is *two* new boot IDs where you expected a
+  resume, the middle one short and carrying `elfcorehdr=` on its command line —
+  that is the kdump capture kernel, and `kexec -p` fires only on a panic. The
+  08-24 one went unrecorded (the capture kernel panicked too, and kdump had
+  pre-empted pstore); the 09-17 one was captured by both mechanisms, which is
+  how it got its name. It is a driver bug; nothing here fixes it. Note that a
+  hibernation which never resumes flushes **nothing** to the journal after
+  `hibernation entry`, so the last logged line is where logging stopped, not
+  where the kernel stopped.
+- **With kdump armed, a panic after the image is written still loses the
+  session** — the capture kernel's `swapon` erases the image (Part 6, second
+  trap). Proposed fix not yet verified.
+- **Resuming from hibernation on Ubuntu kernels 7.0.0-28 … -31 can lock the
+  machine up to hours later** (upstream drm/ttm bulk_move bug, Part 7). Reboot
+  after a resume until `ttm-fix-check` reports `fixed`. This is a kernel bug in
+  the swapout path, not something this repository's configuration causes — but
+  hibernation is what triggers it, so it belongs here.
 - **`/` needs room.** A 32 GB swapfile left ~22 GB free on a 95 GB root
   partition here. Keep an eye on snaps and `/var`.
 - Machine-specific UUIDs in the documentation are placeholders

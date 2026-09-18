@@ -1,6 +1,7 @@
 # Framework 13 (AMD 7840U) — Suspend & Hibernate on Ubuntu 26.04
 
-Working notes from fixing suspend/hibernate on **tinkertoy**, 2026-08-12 → 2026-08-19.
+Working notes from fixing suspend/hibernate on **tinkertoy**, 2026-08-12 → 2026-08-19,
+plus the postmortems that followed (Parts 6–10, to 2026-09-18).
 Covers what was broken, how it was diagnosed, what was installed, and the
 non-obvious traps that cost the most time.
 
@@ -18,11 +19,13 @@ non-obvious traps that cost the most time.
 8. [Part 6 — A lost session, diagnosed](#part-6--a-lost-session-diagnosed)
 9. [Part 7 — The kernel-upgrade trap](#part-7--the-kernel-upgrade-trap)
 10. [Part 8 — A panic during hibernation, and no vmcore](#part-8--a-panic-during-hibernation-and-no-vmcore)
-11. [Installed files — full inventory](#installed-files--full-inventory)
-12. [Diagnostic cookbook](#diagnostic-cookbook)
-13. [Gotchas worth remembering](#gotchas-worth-remembering)
-14. [Troubleshooting](#troubleshooting)
-15. [How to undo everything](#how-to-undo-everything)
+11. [Part 9 — A lockup an hour after resume: the drm/ttm bulk_move bug](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)
+12. [Part 10 — Part 8's panic, named — and the capture kernel that ate the image](#part-10--part-8s-panic-named--and-the-capture-kernel-that-ate-the-image)
+13. [Installed files — full inventory](#installed-files--full-inventory)
+14. [Diagnostic cookbook](#diagnostic-cookbook)
+15. [Gotchas worth remembering](#gotchas-worth-remembering)
+16. [Troubleshooting](#troubleshooting)
+17. [How to undo everything](#how-to-undo-everything)
 
 ---
 
@@ -40,6 +43,7 @@ non-obvious traps that cost the most time.
 | Emergency hibernate reserve | 2% of battery (packaged default) | **7%** |
 | Hibernating on a stale kernel | silently lost the session **and** 72% of the battery | lid plain-suspends until you reboot |
 | WiFi back after hibernate resume | ~18 s (MT7922 firmware reload) | **~4 s** (AX210, clean restore) |
+| Resume from hibernation on 7.0.0-28 … -31 | can lock the machine minutes–hours later (upstream drm/ttm bug) | **reboot after a hibernation resume** until the fix ships; `ttm-fix-check` says when |
 
 **Day-to-day behaviour now**
 
@@ -50,6 +54,8 @@ non-obvious traps that cost the most time.
 - Unplugging the charger no longer wakes it — the original complaint
 - Battery critically low while awake → hibernates at 7%, with enough charge left to finish writing the image
 - **A kernel was installed but not yet booted** → lid closed *plain-suspends* instead of hibernating, until you reboot ([Part 7](#part-7--the-kernel-upgrade-trap))
+- **Resumed from a hibernation image** → reboot before doing anything that matters, until Ubuntu ships the drm/ttm fix ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)). A plain suspend afterwards is fine.
+- **A panic while an image is on disk** → the kdump capture kernel currently erases the image ([Part 10](#part-10--part-8s-panic-named--and-the-capture-kernel-that-ate-the-image)); stay on AC when the session matters so the 7% emergency hibernate never fires.
 
 ---
 
@@ -57,7 +63,7 @@ non-obvious traps that cost the most time.
 
 ```
 Framework 13, AMD Ryzen 7 7840U
-Ubuntu 26.04 LTS, kernel 7.0.0-29-generic, systemd 259, GNOME/Wayland
+Ubuntu 26.04 LTS, kernel 7.0.0-31-generic (7.0.0-29 when first written), systemd 259, GNOME/Wayland
 BIOS 03.20 (all firmware current per fwupdmgr)
 Secure Boot: disabled     kernel lockdown: [none]
 RAM: 59.4 GiB             page size: 4096
@@ -1268,6 +1274,386 @@ point — if the capture kernel dies in that situation, pstore still has the dme
 
 ---
 
+## Part 9 — A lockup an hour after resume: the drm/ttm bulk_move bug
+
+Everything before this part was about sleep that didn't save power, or a
+session that didn't come back. This one is new: on 2026-09-17 the resume
+**succeeded** — same boot ID, desktop intact, WiFi up in seconds — and then an
+hour later, in the middle of a lecture being streamed over Teams, the machine
+froze solid. The cause is a **known upstream kernel bug** in the GPU driver's
+memory manager, and the thing that arms it is *resuming from hibernation*.
+That makes it this document's problem.
+
+### Symptom
+
+Lid opened at 09:06, resumed from the image written the previous day (lid
+closed 09:42 on 09-16, hibernated at 11:43 when the 2 h countdown expired).
+Teaching setup: Teams in Edge, a UGREEN USB capture card pulling an iPad
+screen, DJI mic, projector on `DP-3` over a USB-C adapter. At roughly 10:03
+the display froze and input died. Forced power-off.
+
+### Step 1 — the journal stops, but not where it died
+
+```
+10:03:14  usb 1-2: New USB device found ... Product: DJI MIC MINI
+10:03:14  wireplumber: link failed: some node was destroyed before the link was created
+10:03:17  boltd: probing: timeout, done
+                                            <- nothing after this
+```
+
+A USB re-enumeration and then silence, with no kernel complaint at all. It
+reads exactly like a hard hang. It was not — Part 8's lesson applies in the
+other direction: the journal stopped *flushing* at 10:03, the kernel died at
+10:06, and `pstore` had it.
+
+### Step 2 — the warning, 56 minutes earlier
+
+`journalctl -b -3 -k | grep -B2 -A40 'cut here'` turns up four back-to-back
+`WARNING`s at **09:10:36–37**, from mutter's KMS thread and two kworkers:
+
+```
+ slab kmalloc-rnd-08-192 start ffff8d8d86f01680 pointer offset 64 size 192
+------------[ cut here ]------------
+list_del corruption. prev->next should be ffff8d8d808d6b80, but was ffff8d8d91e9f780.
+WARNING: lib/list_debug.c:62 at __list_del_entry_valid_or_report+0xe4/0x10b, CPU#0: KMS thread/5352
+Hardware name: Framework Laptop 13 (AMD Ryzen 7040Series)/FRANMDCP07, BIOS 03.20 06/23/2026
+Call Trace:
+ ttm_resource_move_to_lru_tail.cold [ttm]
+ ttm_bo_move_to_lru_tail [ttm]
+ amdgpu_dm_plane_helper_prepare_fb [amdgpu]
+ drm_atomic_helper_prepare_planes
+ drm_atomic_helper_commit
+ drm_mode_atomic_ioctl
+```
+
+Three things in that block matter. `list_del corruption` means a linked-list
+node's neighbours no longer point back at it — someone wrote through a stale
+pointer. The `slab kmalloc-rnd-08-192` line above it is the kernel telling you
+the bad pointer lands *inside a freed-and-reused slab object* — a
+use-after-free. And it is a **`WARNING`**, not a `BUG`: `CONFIG_DEBUG_LIST`
+reported the corruption and then let the kernel carry on with the mangled
+list. From here the machine was on borrowed time; the desktop kept working
+for another 56 minutes.
+
+### Step 3 — the death, from pstore
+
+The `efi_pstore` records are split into ~1 KB parts (`Oops#1 Part1` …
+`Part15`) spread across several timestamped directories. Concatenate the
+`dmesg.txt` files and sort on the `[uptime]` field to get one readable trace:
+
+```bash
+sudo cat /var/lib/systemd/pstore/1789654*/*/dmesg.txt \
+  | grep -E '^<[0-9]>\[' | sort -t']' -k1,1 -s | sed 's/^<[0-9]>//'
+```
+
+```
+[10820.977586] BUG: unable to handle page fault for address: 00000002000000d8
+[10820.977603] CPU: 2 UID: 1000 PID: 29805 Comm: nautilus  Tainted: G   W   7.0.0-31-generic
+[10820.977610] RIP: 0010:ttm_lru_bulk_move_tail+0x172/0x360 [ttm]
+[10820.977625] RAX: 0000000200000000 ...
+Call Trace:
+ amdgpu_vm_move_to_lru_tail [amdgpu]
+ amdgpu_cs_submit [amdgpu]
+ amdgpu_cs_ioctl [amdgpu]
+ drm_ioctl
+```
+
+`10820 − 7441 = 3379 s` after the warning → **10:06:55**. The faulting address
+is `0x2_0000_00d8`: a register holding `0x2_0000_0000` (not a pointer at all)
+plus a struct offset. A pointer in the bulk-move cursor had been overwritten
+with garbage, and the first process to submit GPU work through that cursor —
+Nautilus, of all things — dereferenced it. The `Tainted: G W` is the 09:10
+warning; the kernel had flagged itself an hour earlier.
+
+### Step 4 — the red herring
+
+What was going on at 09:10? Reconstructing the minutes before the first
+warning:
+
+| | Event |
+|---|---|
+| 09:06:27 | `Lid opened.` → `PM: hibernation: hibernation exit` |
+| 09:06–09:08 | capture card plugged in, moved to a different port; DJI mic |
+| 09:09:02 | projector connects (`DP-3`, VIA USB-C billboard adapter) |
+| 09:09:08 | terminal opened — `ipad-capture_screen` (mpv on the capture card) |
+| 09:10:34 | `xdg-desktop-portal-gnome: Failed to associate portal window` — the Teams screen-share picker |
+| **09:10:36** | `list_del corruption` ×4 |
+
+Two seconds after screen sharing started, in the compositor's KMS thread,
+while preparing a framebuffer for a plane. Multi-monitor, PipeWire screencast
+exporting dma-bufs, a UVC stream — every ingredient for "the capture card /
+projector / Teams combination is unstable". That is the wrong conclusion, and
+it took an upstream search to see why: screen-share start is simply a burst
+of large GPU allocations, and it was the first one to walk through the
+already-broken cursor. The same configuration had run for a full day on 09-16
+without incident.
+
+### Step 5 — the actual trigger: the hibernation resume four minutes earlier
+
+This is a known bug. The matching report is from **the same hardware**, a
+Framework 13 / 7840U, via Debian #1139599, and the mechanism was worked out on
+amd-gfx / dri-devel between June and September 2026:
+
+- amdgpu keeps each process's GPU buffers grouped in a *bulk-move range* on the
+  driver's LRU list, tracked by a cursor (`first`/`last` pointers).
+- Hibernation makes TTM **swap every GPU buffer out** to system memory so it
+  lands in the image. A May 2026 stable commit — `drm/ttm: Fix ttm_bo_swapout()
+  infinite LRU walk on swapout failure` (upstream `b2ed01e7ad3d`) — put the
+  "remove this buffer from its bulk-move range" step under `if (!ret)`. But the
+  swapout function returns the *number of pages swapped* on success, so the
+  cleanup **never runs**. Swapped-out buffers stay in the range.
+- After resume, when any of those buffers is freed (a window closes, a process
+  exits), the cursor is left pointing at freed memory. The next allocation on
+  that cursor reads it → `list_del corruption` → eventually a fault.
+
+That is exactly the sequence in this boot:
+
+```
+Sep 16 09:42:58  PM: suspend entry (s2idle)
+Sep 16 11:43:00  PM: hibernation: hibernation entry        <- buffers swapped out
+Sep 17 09:06:27  PM: hibernation: hibernation exit
+Sep 17 09:10:36  list_del corruption                        <- 4 min later
+Sep 17 10:06:55  BUG: unable to handle page fault           <- 56 min after that
+```
+
+Why it is intermittent: the bug needs one of the swapped-out buffers to be
+*freed* and the cursor then *reused*. The three boots before this one (from
+08-25, 09-07 and 09-13) resumed from hibernation ten times between them on
+affected kernels and got away with it every time. The upstream
+reports say "minutes to hours after resuming from hibernation", and add that
+heavy GPU memory swapout *without* hibernation — loading a large llama.cpp or
+Ollama model — trips it too.
+
+**Which kernels.** The bad commit reached Ubuntu with the v7.0.10 stable pull
+in `7.0.0-28`; every kernel since carries it, including the `7.0.0-30` that
+this document was written against:
+
+| Ubuntu kernel | v7.0.y merged | bulk_move bug |
+|---|---|---|
+| 7.0.0-26 | ≤ 7.0.9 | no |
+| 7.0.0-28 | 7.0.10 – 7.0.12 | **yes** — first affected |
+| 7.0.0-30, 7.0.0-31 | up to 7.0.14 | **yes** |
+
+The fix is a one-liner — `if (!ret)` → `if (ret > 0)` — landed in
+`drm-misc-fixes` on 2026-09-09 as `drm/ttm: fix swapped-out resources never
+leaving their bulk_move range` (`3db7d7d58341`) plus a follow-up
+`drm/ttm: apply the swapout bulk_move fix to the intended condition`
+(`fcfe64715b42`), both tagged `Cc: stable`. As of 2026-09-18 it is **not in
+mainline, not in any stable release, and not in Ubuntu.** You can check the
+changelog yourself; the changelog Ubuntu ships in
+`/usr/share/doc/linux-image-*/` is truncated, so fetch the full one:
+
+```bash
+V=$(dpkg-query -W -f='${Version}' linux-image-$(uname -r))
+curl -sL "https://changelogs.ubuntu.com/changelogs/pool/main/l/linux/linux_$V/changelog" \
+  | grep -E 'infinite LRU walk on swapout|never leaving their bulk_move'
+# first line present, second absent  = buggy
+# both present                        = fixed
+# neither                             = predates the bug
+```
+
+### The decision
+
+Four options, in order of how much they change:
+
+1. Turn hibernation off (`HandleLidSwitch=suspend`, or `HibernateDelaySec`
+   pushed out to days) until Ubuntu ships the fix.
+2. Build a patched `ttm.ko` — a one-line change, but a hand-built module on a
+   machine whose Part 7 already showed how kernel/module drift bites.
+3. Keep everything, and **reboot after any hibernation resume before doing
+   anything that matters.** A fresh boot has no swapped-out-during-hibernation
+   buffers, so the cursor is never armed. A plain s2idle suspend afterwards is
+   fine; only hibernation swaps GPU buffers out.
+4. Live with it.
+
+**Chosen: 3.** The config in Parts 3–7 stays as it is. The operating rule is
+*resumed from hibernation → reboot before teaching*. Two things make that
+workable rather than a memory test:
+
+```bash
+# Did THIS session come back from a hibernation image?  (yes → reboot first)
+journalctl -b -k | grep -c 'Hibernation image restored successfully'
+```
+
+and `ttm-fix-check`, a daily user timer (`framework13-suspend-scripts/ttm-fix-check*`)
+that fetches the Ubuntu changelog for the running kernel and the apt candidate,
+classifies each as *clean / buggy / fixed*, and sends a desktop notification
+the day a fixed kernel is available — and again once it is the one running, at
+which point the rule can be dropped.
+
+```
+$ ttm-fix-check
+running   7.0.0-31.31    buggy
+candidate 7.0.0-31.31    buggy
+No fix yet — keep rebooting before class.
+```
+
+> **If you take one thing from Part 9:** a `WARNING: ... list_del corruption`
+> in `dmesg` is not noise to scroll past. It is a use-after-free that the kernel
+> has decided to survive, and the survival is temporary. Save your work.
+
+> **And the second thing:** the event that armed the failure (a hibernation
+> resume at 09:06) and the event that fired it (screen sharing at 09:10) and the
+> event that killed the machine (a file-manager GPU submit at 10:06) were three
+> different things an hour apart. Correlating the crash with whatever was on
+> screen at the time would have blamed the capture card.
+
+---
+
+## Part 10 — Part 8's panic, named — and the capture kernel that ate the image
+
+Same day, 12:48. The machine had been running on battery since the morning
+reboot (the projector was on the port that usually carries the charger). At
+**7%** UPower fired `CriticalPowerAction=HybridSleep` — the Part 6 reserve
+doing precisely what it was installed to do. The image was written cleanly.
+And then the kernel panicked, in the same driver and at the same instruction
+that Part 8 had only ever seen inside the capture kernel.
+
+This time both of Part 8's mechanisms recorded it: a pstore dmesg of the
+**hibernating** kernel (uptime 6226 s, not 10 s) and a 456 MB vmcore in
+`/var/crash/202609171250/`. The outstanding item at the bottom of this document
+since 2026-08-25 now has a name.
+
+### The record
+
+```
+[ 6207.122758] PM: hibernation: Creating image
+[ 6207.122758] PM: hibernation: Image created (3050496 pages copied, 664795 zero pages)
+[ 6210.363961] snd_hda_intel 0000:c1:00.1: azx_get_response timeout, switching to polling mode
+[ 6211.365744] snd_hda_intel 0000:c1:00.1: No response from codec, disabling MSI
+[ 6212.377850] PM: thaw of devices complete after 5203.481 msecs          <- audio was already unhappy
+[ 6212.386770] PM: hibernation: Writing hibernation image.
+[ 6225.238460] PM: hibernation: Wrote 12231012 kbytes in 12.83 seconds (953.31 MB/s)
+[ 6225.238470] PM: Image saving done
+[ 6225.238591] PM: S|                                                      <- swap signature written: image is COMPLETE
+[ 6226.145739] BUG: kernel NULL pointer dereference, address: 0000000000000008
+[ 6226.145767] CPU: 0 UID: 0 PID: 0 Comm: swapper/0 Kdump: loaded Not tainted 7.0.0-31-generic
+[ 6226.145776] RIP: 0010:acp63_irq_handler+0x44/0x610 [snd_pci_ps]
+Call Trace:
+ <IRQ>
+ __handle_irq_event_percpu
+ handle_irq_event
+ handle_fasteoi_irq
+ __common_interrupt
+ </IRQ>
+ cpuidle_enter_state ... do_idle
+[ 6227.718699] amdgpu 0000:c1:00.0: Fence fallback timer expired on ring sdma0
+[ 6228.897723] Kernel panic - not syncing: Fatal exception in interrupt
+```
+
+`PM: S|` is `swap_writer_finish()` writing the `S1SUSPEND` signature — the
+last step of a hibernation write. The image on disk was valid and resumable.
+0.9 s later, while the kernel was suspending devices for the S3 half of
+hybrid-sleep, the AMD ACP 6.3 audio interrupt handler ran, followed a pointer
+in its private data that was already `NULL` (`address: 0x8` = field at offset 8
+of a null struct), and because it was in interrupt context there was nothing
+to unwind to. Fatal.
+
+### Why this is Part 8's panic
+
+Compare with the 08-24 record in Part 8, written by the *capture* kernel at
+10 s uptime:
+
+```
+2026-08-24  [   10.295] RIP: 0010:acp63_irq_handler+0x44/0x610 [snd_pci_ps]
+                        BUG: kernel NULL pointer dereference, address: 0…08
+```
+
+Same module, same function, **same offset `+0x44`, same address `0x8`.** Part 8
+read that as the capture kernel's own problem — `irqpoll` calling every handler
+including one whose device was never set up — and fixed it with a module
+blacklist. That was correct, and the blacklist held on 09-17 (the capture
+kernel survived and wrote the vmcore). But the 09-17 record shows the handler
+does the same thing in the *main* kernel, from a real `fasteoi` interrupt, in
+the device-suspend phase that follows image writing. That phase is common to
+plain hibernation (`hibernation_platform_enter`) and hybrid-sleep, so the
+08-24 hibernation panic — whose own dmesg was lost to the ordering problem
+Part 8 fixed — was very probably this. It cannot be proven from the 08-24
+evidence; it is the same driver, the same instruction and the same phase.
+
+`snd_pci_ps` is the driver for the ACP 6.3 audio block on Phoenix; this is a
+driver bug, not configuration, and nothing in this repository can fix it.
+Ubuntu's 7.0.0-28 changelog does carry a batch of AMD SoundWire / ACP
+backports (`Backport ASoC SDCA, AMD SoundWire, and RT722 audio fixes`), which
+makes the timing at least suggestive — both panics post-date it.
+
+### And the session was still lost
+
+The image was complete. `crash_kexec_post_notifiers` delivered the dmesg. The
+capture kernel worked. The next boot should have resumed. It did not:
+
+```
+Sep 17 12:50:30  systemd-hibernate-resume[422]: Unable to resume from device '/dev/disk/by-uuid/<your-swap-uuid>' (259:5) offset 0, continuing boot process.
+Sep 17 12:50:30  kernel: PM: Image not found (code -22)
+```
+
+Part 6's signature — image written, invalid on read-back. The capture kernel's
+journal (the 21-second boot in between) says why:
+
+```
+Sep 17 12:49:58  systemd-hibernate-resume[232]: Reported hibernation image: ... kernel=7.0.0-31-generic
+Sep 17 12:49:58  systemd-hibernate-resume[232]: Successfully cleared HibernateLocation EFI variable.
+Sep 17 12:50:00  systemd[1]: Activating swap dev-disk-by\x2duuid-<your-swap-uuid>.swap ...
+Sep 17 12:50:00  swapon[304]: swapon: /dev/nvme0n1p5: software suspend data detected. Rewriting the swap signature.
+Sep 17 12:50:03  kdump-tools[721]: Starting kdump-tools:
+```
+
+**The capture kernel activated swap from `/etc/fstab`, and `swapon` overwrote
+the hibernation signature.** `noresume` did what Part 8 verified it does — the
+kernel made no attempt to resume — but nothing told the capture kernel's
+systemd to leave the fstab swap entry alone, and util-linux `swapon` treats a
+`S1SUSPEND` signature as stale data to be cleaned up. It even said so. Two
+seconds later the image that Part 6's 7% reserve had been carefully sized to
+protect was gone, and the vmcore was written to disk over a swap partition
+that no longer contained anything.
+
+So with kdump armed, **any** panic during hibernation costs the session even
+when the image write completed — the capture kernel guarantees it. Without
+kdump, this 09-17 panic would have left a resumable image (the signature was
+on disk before the fault) and the next boot would have restored the desktop.
+
+### The fix — proposed, not yet applied
+
+Keep the capture kernel from touching swap at all. Either of these on the
+capture cmdline in `/etc/default/kdump-tools` should do it:
+
+```sh
+# narrowest: stop systemd pulling in swap units
+KDUMP_CMDLINE_APPEND="... noresume systemd.mask=swap.target module_blacklist=..."
+
+# broader: ignore /etc/fstab entirely (root= comes from the cmdline; /var/crash is on /)
+KDUMP_CMDLINE_APPEND="... noresume fstab=no module_blacklist=..."
+```
+
+Neither has been tested on this machine yet. Verify the token reached the
+live capture cmdline via `/var/crash/kexec_cmd` after `kdump-config reload`
+(never via the config file — see Part 8's `KDUMP_CMDLINE_APPEND` trap). A
+*fair* test needs a panic while an unconsumed image is on disk, and there is
+no cheap way to stage that: a sysrq panic on a resumed session has already
+consumed the image, and booting with `noresume` by hand makes the main
+kernel's own `swapon` do exactly what the capture kernel did. So the first
+real recurrence is the test — look for the absence of `software suspend data
+detected` in the capture kernel's journal, and a resume instead of a login
+screen. Until then the operating rule from the TL;DR stands: **stay on AC when
+the session matters**, so the 7% action never fires, and treat a
+capture-kernel boot after a hibernation as a lost session.
+
+> **If you take one thing from Part 10:** a kdump capture kernel is a full boot
+> that processes `/etc/fstab`. `noresume` keeps it off the resume path; it does
+> **not** keep `swapon` off the swap partition, and `swapon` erases hibernation
+> images on sight. Check for `software suspend data detected` in the capture
+> kernel's journal before blaming the image write.
+
+> **And note what the reserve arithmetic looked like from the other side:**
+> `grep Percentage /etc/UPower/UPower.conf` still prints the packaged `2.0`,
+> and it is easy to conclude from that the 7% drop-in never took. It did — the
+> live value is only visible via `/etc/UPower/UPower.conf.d/` or
+> `busctl call org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPower GetCriticalAction`,
+> and the charge curve after the event (18% after 8 min at 31 W) puts the
+> trigger at 7%, not 2%.
+
+---
+
 ## Installed files — full inventory
 
 | Path | Purpose |
@@ -1285,10 +1671,12 @@ point — if the capture kernel dies in that situation, pstore still has the dme
 | `/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf` | Raises the emergency-hibernate battery floor from 2% to 7% (see [Part 6](#part-6--a-lost-session-diagnosed)) |
 | `/etc/default/kdump-tools` | `KDUMP_CMDLINE_APPEND=… noresume module_blacklist=…` — keeps the capture kernel off the resume path and away from the audio/WiFi/GPU drivers that have twice panicked it (see [Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)). Packaged conffile, edited in place; timestamped `.bak-` alongside. |
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
+| `~/.local/bin/ttm-fix-check` | Classifies the running kernel and the apt candidate as clean / buggy / fixed for the drm/ttm bulk_move bug, from the Ubuntu changelog; notifies on change ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)) |
+| `~/.config/systemd/user/ttm-fix-check.{service,timer}` | Runs it daily (`Persistent=true`) |
 | `/etc/default/grub` | `resume=UUID=<your-swap-uuid>` appended — **no `resume_offset`** — plus `crash_kexec_post_notifiers=1` so a panic reaches `pstore` before the kexec jump ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)); timestamped `.bak` alongside |
 | `/etc/fstab` | swap entry now `UUID=<your-swap-uuid>`; the old `/swap.img` line commented out, timestamped `.bak` alongside |
 
-**Current verified state** *(2026-08-24)*
+**Current verified state** *(2026-09-18)*
 
 ```
 armed wake sources:  PNP0C0D (lid), PNP0C0C (power button), pnp0/00:00 + rtc0/alarmtimer
@@ -1306,6 +1694,12 @@ crash_kexec_post_notifiers = Y  (efi_pstore records the panic BEFORE the kexec
                            jump). VERIFIED 2026-08-25: pstore record at kernel
                            uptime 7497 s = the real kernel, not the capture one.
 WiFi                     = Intel AX210 (iwlwifi), ~4 s to activated after resume
+kernel 7.0.0-31          = carries the drm/ttm bulk_move bug (Part 9); fix not
+                           yet in Ubuntu. ttm-fix-check.timer enabled, reports
+                           "buggy / buggy". Operating rule: reboot after any
+                           hibernation resume.
+kdump capture cmdline    = still activates swap from fstab and ERASES a pending
+                           hibernation image (Part 10). Fix proposed, not applied.
 ```
 
 `/swap.img` is **gone** — deleted only after a resume from the partition was
@@ -1402,6 +1796,35 @@ sudo grep -l 'Kernel panic\|BUG:' /var/lib/systemd/pstore/*/*/dmesg.txt
 sudo grep -oE '^<[0-9]>\[ *[0-9]+\.' /var/lib/systemd/pstore/<epoch>/001/dmesg.txt | tail -1
 
 ls -la /var/crash/                     # dated dir = a vmcore was captured
+
+# REASSEMBLE a pstore record.  One panic is split into ~1 KB parts across
+# several epoch dirs (Oops#1 Part1..Part15, not in order). Sort on uptime.
+sudo cat /var/lib/systemd/pstore/<epoch-prefix>*/*/dmesg.txt \
+  | grep -E '^<[0-9]>\[' | sort -t']' -k1,1 -s | sed 's/^<[0-9]>//' \
+  | grep -vE '^\[[0-9. ]+\]  ?\? '          # drop the "? maybe-frame" noise
+
+# DID THIS SESSION COME BACK FROM A HIBERNATION IMAGE?  (yes -> reboot before
+# anything that matters, until the drm/ttm fix ships; see Part 9)
+journalctl -b -k | grep -c 'Hibernation image restored successfully'
+
+# COUNT REAL HIBERNATIONS, not sleep attempts.  "Operation 'suspend-then-
+# hibernate' finished" fires on every wake, including the ones that only
+# suspended. Kernel entry/exit pairs are the honest count.
+journalctl -b -k | grep -cE 'PM: hibernation: hibernation (entry|exit)'
+
+# A COUNTDOWN, NOT NOISE: any of these in the current boot = save work, reboot.
+journalctl -b -k | grep -E 'list_(del|add) corruption|cut here'
+
+# Does the running / candidate kernel carry the drm/ttm bulk_move bug? (Part 9)
+ttm-fix-check
+
+# Did the capture kernel erase a pending hibernation image? (Part 10)
+journalctl -b -1 | grep 'software suspend data detected'
+
+# The LIVE emergency-hibernate threshold. /etc/UPower/UPower.conf still says
+# 2.0; the drop-in is what runs.
+grep -h Percentage /etc/UPower/UPower.conf.d/*.conf
+busctl call org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPower GetCriticalAction
 ```
 
 ---
@@ -1551,6 +1974,46 @@ ls -la /var/crash/                     # dated dir = a vmcore was captured
     [gotcha 7](#gotchas-worth-remembering), which is about *when messages are
     flushed*; this is about *what the numbers in them mean*.
 
+21. **A `list_del corruption` `WARNING` is a use-after-free the kernel chose to
+    survive.** `CONFIG_DEBUG_LIST` reports it and carries on; the machine ran
+    another 56 minutes on 2026-09-17 before the mangled list was dereferenced
+    ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)).
+    The `slab kmalloc-…` line printed just above it says the stale pointer lands
+    in a reused slab object. Treat it as a countdown, and look for the cause
+    *earlier* than the warning — here, a hibernation resume four minutes before.
+
+22. **Resuming from hibernation is not the end of the hibernation's effects.**
+    On Ubuntu kernels `7.0.0-28` through at least `-31`, every GPU buffer swapped
+    out for the image stays on a bulk-move cursor after resume, and freeing one
+    leaves the cursor dangling (upstream drm/ttm bug, fix queued 2026-09-09,
+    not shipped). The crash comes minutes to hours later, from whatever process
+    next submits GPU work. Until the fix lands: reboot after a hibernation
+    resume. Only hibernation swaps GPU buffers out; s2idle does not.
+
+23. **The kdump capture kernel activates swap from `/etc/fstab`, and `swapon`
+    erases hibernation images.** `noresume` stops the *kernel* resuming; it does
+    not stop systemd's fstab generator, and util-linux prints
+    `software suspend data detected. Rewriting the swap signature.` as it
+    destroys the image. So with kdump armed, any panic between `PM: S|` and
+    power-off costs the session even though the image was complete
+    ([Part 10](#part-10--part-8s-panic-named--and-the-capture-kernel-that-ate-the-image)).
+    `systemd.mask=swap.target` or `fstab=no` on the capture cmdline is the
+    proposed fix, unverified.
+
+24. **`grep Percentage /etc/UPower/UPower.conf` lies by omission.** It still
+    shows the packaged `PercentageAction=2.0`; the live 7% comes from
+    `/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf`. Read the drop-in dir
+    or ask the daemon (`GetCriticalAction` over `busctl`) before concluding the
+    reserve "didn't take". The 2026-09-17 emergency hybrid-sleep fired at 7%,
+    as designed.
+
+25. **`Operation 'suspend-then-hibernate' finished` is logged on every wake,
+    hibernated or not.** Counting it over-reports hibernations by the number of
+    plain-suspend wakes. `PM: hibernation: hibernation entry` / `exit` pairs in
+    the kernel log are the real count, and
+    `Hibernation image restored successfully` is the one-line answer to "did
+    this session come from an image".
+
 ---
 
 ## Troubleshooting
@@ -1648,6 +2111,30 @@ If it turns out to be genuinely intermittent, the fallback is an explicit
 `/etc/systemd/system-sleep/` hook: record a target timestamp and arm the RTC on
 suspend, then on wake compare wall-clock against the target and trigger
 hibernate if the deadline passed. No inference, nothing to be flaky.
+
+**Machine freezes minutes to hours after a hibernation resume**
+```bash
+journalctl -b -k | grep -E 'Hibernation image restored|list_(del|add) corruption'
+ttm-fix-check
+```
+A restored image plus `list_del corruption` in the same boot is the drm/ttm
+bulk_move bug ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)).
+If the corruption line is already there, save work and reboot now — the crash
+follows within the hour. If `ttm-fix-check` says `buggy`, the only prevention
+is not to work on a resumed session: reboot after hibernation resumes until it
+says `fixed`. If it says `fixed` and this still happens, it is something new —
+reassemble the pstore record (cookbook) and look at the `RIP:` line.
+
+**Panicked during hibernation, image was written, next boot didn't resume**
+```bash
+journalctl -b -1 | grep -E 'elfcorehdr|software suspend data detected'
+sudo grep -l 'PM: S|' /var/lib/systemd/pstore/*/*/dmesg.txt   # image completed?
+```
+`elfcorehdr=` means the middle boot was the kdump capture kernel; the `swapon`
+line means it erased the image ([Part 10](#part-10--part-8s-panic-named--and-the-capture-kernel-that-ate-the-image)).
+The session is gone, but the pstore record names the driver — `acp63_irq_handler
+[snd_pci_ps]` both times so far. Apply the Part 10 capture-cmdline fix and
+verify it in `/var/crash/kexec_cmd`.
 
 **Can't wake the machine by typing**
 Working as configured. Keyboard and touchpad are deliberately disarmed. Use the
@@ -1749,23 +2236,38 @@ back from a live USB.
 - **Check `/var/lib/systemd/pstore/` after any unexplained cold boot**, and
   re-check `/var/crash/kexec_cmd` after a `kdump-tools` upgrade — the settings
   live in a packaged conffile, so an upgrade may prompt to replace it.
+- **Reboot after any hibernation resume, until `ttm-fix-check` reports the
+  running kernel as `fixed`.** Then drop the rule, and disable the timer
+  (`systemctl --user disable --now ttm-fix-check.timer`) — or leave it; it is
+  silent once both columns read `fixed`. When the fix arrives it will show in
+  the Ubuntu changelog as `drm/ttm: fix swapped-out resources never leaving
+  their bulk_move range`.
+- **Stay on AC whenever the session matters**, until the Part 10 capture-kernel
+  fix is applied and verified — an emergency hybrid-sleep is currently a lost
+  session if the audio driver panics during it, and it has done so twice.
+- **Watch for `acp63_irq_handler` disappearing from future pstore records** after
+  audio-driver updates; that is the only signal that the Part 10 panic is fixed.
 - **If the WiFi card is swapped again, re-measure the resume time**
   ([gotcha 8](#gotchas-worth-remembering)) — it's a driver property, not a
   hibernate one.
 
 ---
 
-*Last updated 2026-08-25. **One thing outstanding:** an unexplained kernel panic
-during hibernation on 2026-08-24 ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore))
-— two of three hibernations that day succeeded, the third panicked, and **the
-cause is still unknown**. Diagnosis had been blocked by two separate failures:
-the kdump capture kernel was panicking on its own device probing, and kdump was
-pre-empting `pstore`, so neither mechanism ever recorded anything. Both are fixed
-(`crash_kexec_post_notifiers=1` plus a capture-kernel module blacklist) and
-**both were verified against a real panic on 2026-08-25** — a 456 MB vmcore and a
-pstore dmesg of the crashing kernel itself. The next hibernation panic should
-name its driver. Everything else remains verified on the swap partition: manual
-`systemctl hibernate`, a full 2 h lid-closed suspend-then-hibernate cycle, and a
-16 h 55 m overnight hibernation that resumed into the same boot ID at a cost of
-well under 1% of the battery. The stale-kernel lid guard is installed, enabled,
-and passes its self-test.*
+*Last updated 2026-09-18. **The outstanding item from 08-25 is closed:** the
+panic during hibernation has a name — `acp63_irq_handler [snd_pci_ps]`, a NULL
+dereference in the AMD audio interrupt handler during the device-suspend phase
+after the image is written, recorded on 2026-09-17 by both `pstore` (uptime
+6226 s, the real kernel) and a 456 MB vmcore, exactly as Part 8's fixes were
+meant to deliver ([Part 10](#part-10--part-8s-panic-named--and-the-capture-kernel-that-ate-the-image)).
+It is a driver bug, outside this repository's reach.
+**Two things are now outstanding instead.** First, the same day's other failure:
+resuming from hibernation on any Ubuntu kernel since `7.0.0-28` arms a known
+drm/ttm use-after-free that locked the machine an hour after a clean resume
+([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)).
+The upstream fix is queued but unshipped; until `ttm-fix-check` says
+otherwise, the rule is *reboot after a hibernation resume*. Second, the kdump
+capture kernel erases a pending hibernation image by activating swap from
+`fstab` — a fix is proposed in Part 10 and not yet applied. Everything else
+remains as verified on 08-25: the wake-source policy, the swap partition,
+suspend-then-hibernate, the stale-kernel lid guard, and crash capture — which
+has now proven itself against a real hibernation panic, not just a `sysrq`.*

@@ -22,6 +22,8 @@ without root — diff them if you want to be sure).
 | `stale-kernel-lid-guard.service` | `/etc/systemd/system/` (0644) |
 | `zzz-stale-kernel-lid-guard` | `/etc/kernel/postinst.d/` (0755) |
 | `suspend-report` | `~/.local/bin/` (0755) |
+| `ttm-fix-check` | `~/.local/bin/` (0755) |
+| `ttm-fix-check.service` + `.timer` | `~/.config/systemd/user/` (0644); user timer, daily |
 | `crash-evidence-setup.sh` | run once with sudo; not installed. Edits `/etc/default/grub` + `/etc/default/kdump-tools`. |
 | `kdump-noresume.sh` | **superseded** by the above; kept for reference |
 | `setup-hibernate.sh` | run once with sudo; not installed |
@@ -72,6 +74,16 @@ sudo "$D/crash-evidence-setup.sh"    # idempotent; verifies everything it change
 # 8. health check
 install -m 0755 "$D/suspend-report" ~/.local/bin/suspend-report
 suspend-report
+
+# 9. drm/ttm bulk_move bug watch (Part 9 of the write-up): tells you when a
+#    kernel without the hibernate-resume lockup is available / running.
+#    Until it says "fixed": reboot after any hibernation resume.
+install -m 0755 "$D/ttm-fix-check" ~/.local/bin/ttm-fix-check
+install -D -m 0644 "$D/ttm-fix-check.service" ~/.config/systemd/user/ttm-fix-check.service
+install -D -m 0644 "$D/ttm-fix-check.timer"   ~/.config/systemd/user/ttm-fix-check.timer
+systemctl --user daemon-reload
+systemctl --user enable --now ttm-fix-check.timer
+ttm-fix-check
 ```
 
 ## The ones that bite

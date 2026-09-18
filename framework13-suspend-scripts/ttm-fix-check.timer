@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily check for the drm/ttm hibernate-resume kernel fix
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

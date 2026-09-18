@@ -1,0 +1,7 @@
+[Unit]
+Description=Check whether Ubuntu's kernel has the drm/ttm hibernate-resume fix
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ttm-fix-check --quiet
