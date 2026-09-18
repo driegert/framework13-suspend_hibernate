@@ -1,0 +1,41 @@
+#!/bin/sh
+# /etc/systemd/system-sleep/zz-hibernate-resume-warn
+# After every wake, if this boot has written a hibernation image since the
+# last wake, tell every graphical user to reboot (see Part 9 of the write-up).
+# $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate|...
+#
+# Counts "hibernation entry" lines, not restores: the GPU buffers are swapped
+# out when the image is WRITTEN, so a hybrid-sleep that woke from RAM is armed
+# too. Uses the larger of dmesg (synchronous, but a ring buffer that can wrap)
+# and the journal (durable, but journald may not have caught up yet).
+#
+# systemd waits for system-sleep hooks. Everything here is milliseconds, and
+# the UI is handed off to the user's manager via systemd-run, which returns
+# immediately -- but bound each external call anyway.
+
+[ "${1:-}" = "post" ] || exit 0
+
+STATE=/run/hibernate-resume-warn.count   # tmpfs: survives hibernation (it is RAM), gone on a fresh boot
+UI=/usr/local/bin/hibernate-resume-warn
+PAT='PM: hibernation: hibernation entry'
+T=""; command -v timeout >/dev/null 2>&1 && T="timeout 5"
+
+a=$($T dmesg 2>/dev/null | grep -c "$PAT")
+b=$($T journalctl -b -k --no-pager -o cat 2>/dev/null | grep -c "$PAT")
+n=$a; [ "${b:-0}" -gt "$n" ] && n=$b
+prev=$(cat "$STATE" 2>/dev/null || echo 0)
+echo "$n" > "$STATE"
+[ "$n" -gt "$prev" ] || exit 0
+
+# Every user with a graphical session gets the dialog, via their own
+# systemd --user manager (which carries DISPLAY / WAYLAND_DISPLAY / the
+# session bus). --collect keeps a dismissed dialog from lingering as a unit.
+$T loginctl list-sessions --no-legend 2>/dev/null | while read -r sid uid user rest; do
+    case "$($T loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
+        wayland|x11|mir) ;;
+        *) continue ;;
+    esac
+    $T systemd-run --machine="$user@" --user --collect --quiet \
+        --unit="hibernate-resume-warn-$(date +%s)" "$UI" --force || :
+done
+exit 0

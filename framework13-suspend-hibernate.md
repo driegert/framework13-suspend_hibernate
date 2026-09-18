@@ -1481,6 +1481,24 @@ classifies each as *clean / buggy / fixed*, and sends a desktop notification
 the day a fixed kernel is available — and again once it is the one running, at
 which point the rule can be dropped.
 
+And, because "remember to check" is not a plan: **`zz-hibernate-resume-warn`**,
+a `post`-phase sleep hook (the same mechanism as `framework-wakeup-policy.sleep`)
+that after every wake counts `PM: hibernation: hibernation entry` lines in the
+current boot's kernel log — the larger of `dmesg` and `journalctl -b -k`, since
+the ring buffer can wrap and journald can lag — and, if the count rose since the
+last wake, hands off to `hibernate-resume-warn` in each graphical user's own
+`systemd --user` manager via `systemd-run --machine=user@ --user`. That script
+posts a **critical** notification (GNOME does not auto-dismiss those, and they
+survive the lock screen) and a `zenity` dialog with **Reboot now / Later** that
+stays up until answered. State lives in `/run`, which is RAM — restored with
+the image, empty on a fresh boot — so a plain suspend after the reboot warns
+nothing, and a hibernation resume warns exactly once.
+
+Counting *image creations* rather than *restores* is deliberate: the GPU buffers
+are swapped out when the image is written, so a hybrid-sleep that woke from
+RAM, or a hibernation that failed after the snapshot, is armed too. False
+positives cost a reboot; false negatives cost the session.
+
 ```
 $ ttm-fix-check
 running   7.0.0-31.31    buggy
@@ -1673,6 +1691,8 @@ capture-kernel boot after a hibernation as a lost session.
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
 | `~/.local/bin/ttm-fix-check` | Classifies the running kernel and the apt candidate as clean / buggy / fixed for the drm/ttm bulk_move bug, from the Ubuntu changelog; notifies on change ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)) |
 | `~/.config/systemd/user/ttm-fix-check.{service,timer}` | Runs it daily (`Persistent=true`) |
+| `/etc/systemd/system-sleep/zz-hibernate-resume-warn` | `post`-phase sleep hook: if this boot has written a hibernation image since the last wake, launches the warning in every graphical user's session ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)). State in `/run/hibernate-resume-warn.count`. |
+| `/usr/local/bin/hibernate-resume-warn` | The warning itself: critical notification + zenity **Reboot now / Later** dialog. `--quiet` prints this boot's image count; no args warns only if it is > 0. |
 | `/etc/default/grub` | `resume=UUID=<your-swap-uuid>` appended — **no `resume_offset`** — plus `crash_kexec_post_notifiers=1` so a panic reaches `pstore` before the kexec jump ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)); timestamped `.bak` alongside |
 | `/etc/fstab` | swap entry now `UUID=<your-swap-uuid>`; the old `/swap.img` line commented out, timestamped `.bak` alongside |
 
@@ -1806,6 +1826,8 @@ sudo cat /var/lib/systemd/pstore/<epoch-prefix>*/*/dmesg.txt \
 # DID THIS SESSION COME BACK FROM A HIBERNATION IMAGE?  (yes -> reboot before
 # anything that matters, until the drm/ttm fix ships; see Part 9)
 journalctl -b -k | grep -c 'Hibernation image restored successfully'
+hibernate-resume-warn --quiet          # same question, counting images WRITTEN this boot
+sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake; dialog iff count rose
 
 # COUNT REAL HIBERNATIONS, not sleep attempts.  "Operation 'suspend-then-
 # hibernate' finished" fires on every wake, including the ones that only

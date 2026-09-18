@@ -118,6 +118,8 @@ nodes). If it reports 20-something today, this repo is for you.
 | `kdump-noresume.sh` | superseded by the above | — |
 | `suspend-report` | `~/.local/bin/` (0755) | ⚠️ edit battery model |
 | `ttm-fix-check` + `.service` + `.timer` | `~/.local/bin/`, `~/.config/systemd/user/` | ⚠️ Ubuntu changelog URLs; edit `PKG` for a non-HWE kernel |
+| `hibernate-resume-warn` | `/usr/local/bin/` (0755) | ✅ needs `notify-send`; `zenity` optional |
+| `zz-hibernate-resume-warn` | `/etc/systemd/system-sleep/` (0755) | ✅ as-is |
 
 All of it lives in [`framework13-suspend-scripts/`](framework13-suspend-scripts/).
 
@@ -331,6 +333,13 @@ journalctl -b -k | grep -E 'Hibernation image restored|list_del corruption'
 ```
 — the first line means "this session came from an image", the second means
 "the corruption has already happened; save your work and reboot now".
+
+**`zz-hibernate-resume-warn` + `hibernate-resume-warn`** turn the first of
+those into something you can't miss: a sleep hook that, after any wake
+following a hibernation image being written this boot, puts a critical
+notification and a **Reboot now / Later** dialog on every graphical session.
+The dialog stays until answered. It fires once per hibernation, never on a
+plain suspend, and never on a fresh boot.
 
 ### Part 4 — `suspend-report`
 
@@ -660,6 +669,10 @@ install -D -m 0644 "$D/ttm-fix-check.timer"   ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ttm-fix-check.timer
 ttm-fix-check          # "buggy" = reboot after every hibernation resume, for now
+
+sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/
+sudo install -m 0755 "$D/zz-hibernate-resume-warn" /etc/systemd/system-sleep/
+sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # dialog appears iff this boot has hibernated
 ```
 
 ---

@@ -1,0 +1,56 @@
+#!/bin/bash
+# Warn, loudly and persistently, that this session has been through a
+# hibernation and should be rebooted before doing anything that matters.
+#
+# Why: on Ubuntu kernels 7.0.0-28 .. (see Part 9 of the write-up) every GPU
+# buffer swapped out while writing a hibernation image is left on a dangling
+# bulk_move cursor after resume. Freeing one and allocating again corrupts the
+# TTM LRU; the machine locks up minutes to hours later. A fresh boot has no such
+# buffers. Only image creation swaps them out, so this counts
+# "PM: hibernation: hibernation entry" lines in the current boot, not restores.
+#
+#   hibernate-resume-warn          warn if this boot has hibernated at all
+#   hibernate-resume-warn --force  warn unconditionally (used by the sleep hook,
+#                                  which has already decided a new one happened)
+#   hibernate-resume-warn --quiet  print the count and exit 0/1, no UI
+#
+# Runs as the logged-in user. Needs notify-send; uses zenity when present.
+set -u
+
+count() {
+    journalctl -b -k --no-pager -o cat 2>/dev/null | grep -c 'PM: hibernation: hibernation entry'
+}
+
+MODE=${1:-}
+N=$(count)
+
+case "$MODE" in
+    --quiet)
+        echo "$N"; [ "$N" -gt 0 ] && exit 1 || exit 0 ;;
+    --force) ;;
+    *)
+        if [ "$N" -eq 0 ]; then
+            echo "This boot has not hibernated -- nothing to warn about."
+            exit 0
+        fi ;;
+esac
+
+TITLE="Reboot before you rely on this session"
+BODY="This session has been through a hibernation (${N} image$( [ "$N" -ne 1 ] && echo s) written this boot). \
+On kernel $(uname -r) that arms a known GPU-driver bug (drm/ttm bulk_move) that can lock the machine up \
+minutes to hours later, whatever you are doing. A reboot clears it; a plain suspend does not re-arm it."
+
+# Critical-urgency notifications are not auto-dismissed by GNOME Shell and
+# survive the lock screen, so this is visible right after unlocking.
+notify-send -a hibernate-resume-warn -u critical -i system-reboot "$TITLE" "$BODY" 2>/dev/null || :
+
+if command -v zenity >/dev/null 2>&1; then
+    if zenity --question --title="$TITLE" --width=460 --icon=system-reboot \
+              --text="<b>$TITLE</b>\n\n$BODY\n\nRun <tt>ttm-fix-check</tt> to see whether a fixed kernel has shipped." \
+              --ok-label="Reboot now" --cancel-label="Later" 2>/dev/null; then
+        systemctl reboot
+    fi
+else
+    echo "$TITLE: $BODY"
+fi
+exit 0

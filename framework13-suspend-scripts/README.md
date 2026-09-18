@@ -24,6 +24,8 @@ without root — diff them if you want to be sure).
 | `suspend-report` | `~/.local/bin/` (0755) |
 | `ttm-fix-check` | `~/.local/bin/` (0755) |
 | `ttm-fix-check.service` + `.timer` | `~/.config/systemd/user/` (0644); user timer, daily |
+| `hibernate-resume-warn` | `/usr/local/bin/` (0755); runs as the user |
+| `zz-hibernate-resume-warn` | `/etc/systemd/system-sleep/` (0755); sleep hook, `post` phase |
 | `crash-evidence-setup.sh` | run once with sudo; not installed. Edits `/etc/default/grub` + `/etc/default/kdump-tools`. |
 | `kdump-noresume.sh` | **superseded** by the above; kept for reference |
 | `setup-hibernate.sh` | run once with sudo; not installed |
@@ -84,6 +86,14 @@ install -D -m 0644 "$D/ttm-fix-check.timer"   ~/.config/systemd/user/ttm-fix-che
 systemctl --user daemon-reload
 systemctl --user enable --now ttm-fix-check.timer
 ttm-fix-check
+
+# 10. persistent "reboot me" dialog after any wake that follows a hibernation
+#     image being written (Part 9). Counts image creations in this boot; the
+#     root-side hook hands the UI to your systemd --user manager.
+sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/hibernate-resume-warn
+sudo install -m 0755 "$D/zz-hibernate-resume-warn" /etc/systemd/system-sleep/zz-hibernate-resume-warn
+hibernate-resume-warn --quiet          # prints this boot's count; 0 = fresh boot
+sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake
 ```
 
 ## The ones that bite
