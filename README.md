@@ -308,7 +308,7 @@ resume into a lockup minutes to hours later, on AMD APUs running Ubuntu kernels
 `7.0.0-28` and later (upstream drm/ttm: buffers swapped out for the image are
 never removed from their bulk-move range; freeing one after resume leaves a
 dangling cursor; the next GPU submission faults). Fix queued upstream
-2026-09-09, not shipped as of 2026-09-18. Details and the evidence in Part 9 of
+2026-09-09, not shipped as of 2026-09-19. Details and the evidence in Part 9 of
 the write-up.
 
 Until it ships, the only prevention is **reboot after any hibernation resume**
@@ -329,7 +329,7 @@ package name); adapt `PKG` if you are not on the HWE kernel.
 
 Also worth knowing: the tell that a session is already in the danger state is
 ```sh
-journalctl -b -k | grep -E 'Hibernation image restored|list_del corruption'
+journalctl -b -k | grep -E 'Hibernation image restored|list_(del|add) corruption'
 ```
 — the first line means "this session came from an image", the second means
 "the corruption has already happened; save your work and reboot now".
@@ -340,6 +340,15 @@ following a hibernation image being written this boot, puts a critical
 notification and a **Reboot now / Later** dialog on every graphical session.
 The dialog stays until answered. It fires once per hibernation, never on a
 plain suspend, and never on a fresh boot.
+
+It is two stages on purpose. `systemd-sleep` keeps `user.slice` frozen until
+the `post` hooks have *returned*, so a hook cannot reach any user session
+directly — `systemd-run --user` fails, silently if you let it. The hook only
+counts and schedules a 3-second system timer; the timer's service starts the
+dialog after the thaw. Both stages log under `hibernate-resume-warn`:
+```sh
+journalctl -b -t hibernate-resume-warn      # "scheduling the reboot dialog" then "dialog started for <user>"
+```
 
 ### Part 4 — `suspend-report`
 
@@ -672,7 +681,8 @@ ttm-fix-check          # "buggy" = reboot after every hibernation resume, for no
 
 sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/
 sudo install -m 0755 "$D/zz-hibernate-resume-warn" /etc/systemd/system-sleep/
-sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # dialog appears iff this boot has hibernated
+sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog appears ~3 s later; click Later
+journalctl -b -t hibernate-resume-warn                                   # both stages should have logged
 ```
 
 ---

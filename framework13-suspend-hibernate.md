@@ -1494,6 +1494,13 @@ stays up until answered. State lives in `/run`, which is RAM — restored with
 the image, empty on a fresh boot — so a plain suspend after the reboot warns
 nothing, and a hibernation resume warns exactly once.
 
+The handoff is **two stages**, and the reason is the subject of the next
+section: the hook itself only counts and, if the count rose, asks the *system*
+manager for a transient timer (`systemd-run --on-active=3 … dispatch`); the
+timer's service, three seconds later, is what walks `loginctl list-sessions`
+and starts the dialog in each session. Both stages log to the journal under
+`hibernate-resume-warn`, so "did it fire?" is a `journalctl -t` away.
+
 Counting *image creations* rather than *restores* is deliberate: the GPU buffers
 are swapped out when the image is written, so a hybrid-sleep that woke from
 RAM, or a hibernation that failed after the snapshot, is armed too. False
@@ -1515,6 +1522,77 @@ No fix yet — keep rebooting before class.
 > event that killed the machine (a file-manager GPU submit at 10:06) were three
 > different things an hour apart. Correlating the crash with whatever was on
 > screen at the time would have blamed the capture card.
+
+### Second occurrence (2026-09-19) — and the warning that never fired
+
+Two days later, the same bug, two minutes instead of an hour, and this time
+with a vmcore. The user-visible story was "I plugged in a USB-C dock, turned
+off the internal panel, and the laptop rebooted." The journal's story:
+
+```
+10:25:31  PM: hibernation: Hibernation image restored successfully   <- asleep 15h50m; image from 18:34 the day before
+10:25:31  ttm-fix-check: running 7.0.0-31.31 buggy                    <- the daily timer, catching up
+10:26:23  list_add corruption ... ttm_resource_move_to_lru_tail  (kitty)   <- ×4, before the dock
+10:26:34  list_del corruption ... (kitty)
+10:27:08  usb 5-1.3.2: Glorious Model D Wireless                      <- the dock's mouse
+10:27:24  gnome-control-center                                        <- Displays panel
+10:27:33  (journal ends)
+```
+
+and the kdump dmesg's, 60 ms apart:
+
+```
+[25075.951] WARNING ... RIP: dcn31_program_compbuf_size+0xcc [amdgpu]   Comm: KMS thread
+[25076.010] BUG: kernel NULL pointer dereference, address: 0000000000000008
+[25076.010] RIP: 0010:ttm_lru_bulk_move_tail+0x1a5/0x360 [ttm]         Comm: papers
+[25076.559] Kernel panic - not syncing: Fatal exception
+```
+
+Same `RIP` as [Step 3](#step-3--the-death-from-pstore) (a different
+offset, since this time it was a `list_add` walk rather than a `list_del`). The
+corruption was already logged **before** the dock was plugged in; turning the
+panel off made the KMS thread reallocate the display buffers, and the next
+process to touch the LRU — a PDF viewer — walked into the NULL. The dock was the
+trigger. A fresh-boot session would have taken it in stride.
+
+What made this occurrence worth a section is the part that was supposed to be
+solved: the reboot-me dialog from the previous day was installed, had been
+tested by hand, and did not appear. `journalctl -b -2 | grep hibernate-resume-warn`
+showed the manual test from the day before and nothing at 10:25. The hook had
+no logging of its own, and its one external call was `systemd-run --quiet … || :`.
+
+The cause is in `systemd-sleep` itself. Since v255 it freezes `user.slice` for
+the duration of the sleep — and in `sleep.c` the freeze is in `run()`, the
+`post` hooks are in `execute()`, and the thaw is back in `run()` *after*
+`execute()` returns. Every `post` hook therefore runs while every user session,
+and every user's `systemd --user`, is a frozen cgroup. The timestamps agree:
+
+```
+10:25:31.431620  systemd-sleep: System returned from sleep operation 'suspend-then-hibernate'.
+10:25:31.547403  systemd-sleep: Successfully thawed unit 'user.slice'.
+```
+
+The hooks ran inside those 116 ms. `systemd-run --machine=dave@ --user` needs
+the user manager to answer; it could not; the hook swallowed the failure. The
+manual test had passed because a shell on the desktop is not frozen.
+
+Reproduced on demand, from a transient *system* unit so the freeze does not
+freeze the test:
+
+```
+A: freezing user.slice, calling stage two INLINE (the old behaviour)
+   hibernate-resume-warn: FAILED to start the dialog for dave (session 2), rc=1
+B: freezing user.slice, calling the hook as systemd-sleep does (post, test mode)
+   systemd[1]: Started hibernate-resume-warn-dispatch-1789828689.timer
+   ...thaw...
+   systemd[1]: Started hibernate-resume-warn-dispatch-1789828689.service   <- +5 s
+   hibernate-resume-warn: dialog started for dave (session 2)
+```
+
+Hence the two-stage hook described above. The general rule, which applies to
+any `system-sleep` hook that wants to reach a user: **you are not in the
+session, you are in the 100 ms before it exists again.** Decide in the hook;
+act from a timer.
 
 ---
 
@@ -1691,7 +1769,7 @@ capture-kernel boot after a hibernation as a lost session.
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
 | `~/.local/bin/ttm-fix-check` | Classifies the running kernel and the apt candidate as clean / buggy / fixed for the drm/ttm bulk_move bug, from the Ubuntu changelog; notifies on change ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)) |
 | `~/.config/systemd/user/ttm-fix-check.{service,timer}` | Runs it daily (`Persistent=true`) |
-| `/etc/systemd/system-sleep/zz-hibernate-resume-warn` | `post`-phase sleep hook: if this boot has written a hibernation image since the last wake, launches the warning in every graphical user's session ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)). State in `/run/hibernate-resume-warn.count`. |
+| `/etc/systemd/system-sleep/zz-hibernate-resume-warn` | `post`-phase sleep hook: if this boot has written a hibernation image since the last wake, schedules a 3 s system timer that launches the warning in every graphical user's session — two stages, because the hook runs while `user.slice` is still frozen ([Part 9](#second-occurrence-2026-09-19--and-the-warning-that-never-fired)). State in `/run/hibernate-resume-warn.count`; logs as `hibernate-resume-warn`. |
 | `/usr/local/bin/hibernate-resume-warn` | The warning itself: critical notification + zenity **Reboot now / Later** dialog. `--quiet` prints this boot's image count; no args warns only if it is > 0. |
 | `/etc/default/grub` | `resume=UUID=<your-swap-uuid>` appended — **no `resume_offset`** — plus `crash_kexec_post_notifiers=1` so a panic reaches `pstore` before the kexec jump ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)); timestamped `.bak` alongside |
 | `/etc/fstab` | swap entry now `UUID=<your-swap-uuid>`; the old `/swap.img` line commented out, timestamped `.bak` alongside |
@@ -1828,6 +1906,8 @@ sudo cat /var/lib/systemd/pstore/<epoch-prefix>*/*/dmesg.txt \
 journalctl -b -k | grep -c 'Hibernation image restored successfully'
 hibernate-resume-warn --quiet          # same question, counting images WRITTEN this boot
 sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake; dialog iff count rose
+sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog unconditionally, ~3 s later
+journalctl -b -t hibernate-resume-warn                                   # did it fire, and did the dialog start?
 
 # COUNT REAL HIBERNATIONS, not sleep attempts.  "Operation 'suspend-then-
 # hibernate' finished" fires on every wake, including the ones that only
@@ -2035,6 +2115,16 @@ busctl call org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPowe
     the kernel log are the real count, and
     `Hibernation image restored successfully` is the one-line answer to "did
     this session come from an image".
+
+26. **`system-sleep` `post` hooks run while every user session is frozen.**
+    `systemd-sleep` (v255+) freezes `user.slice` in `run()`, runs the hooks
+    in `execute()`, and thaws after `execute()` returns — on this machine the
+    hooks had 116 ms between "System returned from sleep" and "thawed unit
+    'user.slice'". `systemd-run --user`, `notify-send`, anything over the
+    session bus: fails or hangs, and a hand test from a desktop shell passes
+    because nothing is frozen then. Decide in the hook; act from a
+    `systemd-run --on-active=` timer in the system manager
+    ([Part 9](#second-occurrence-2026-09-19--and-the-warning-that-never-fired)).
 
 ---
 

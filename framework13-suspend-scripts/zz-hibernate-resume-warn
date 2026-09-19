@@ -3,39 +3,81 @@
 # After every wake, if this boot has written a hibernation image since the
 # last wake, tell every graphical user to reboot (see Part 9 of the write-up).
 # $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate|...
+#   also:  post test   skip the counting, fire unconditionally (for testing)
+#          dispatch    stage two (below); runs from a transient system unit
 #
 # Counts "hibernation entry" lines, not restores: the GPU buffers are swapped
 # out when the image is WRITTEN, so a hybrid-sleep that woke from RAM is armed
 # too. Uses the larger of dmesg (synchronous, but a ring buffer that can wrap)
 # and the journal (durable, but journald may not have caught up yet).
 #
+# TWO STAGES, because systemd-sleep (v255+) freezes user.slice before the
+# sleep and thaws it only after the post hooks have RETURNED (sleep.c: run()
+# freezes, execute() runs the hooks, run() thaws). While this hook runs,
+# every user session and every user's systemd --user manager is frozen, so
+# anything that talks to the session -- systemd-run --user, notify-send over
+# the session bus -- fails or hangs. Seen on systemd 259 (2026-09-19): the
+# hook ran in the 116 ms between "System returned from sleep operation" and
+# "Successfully thawed unit 'user.slice'", and no dialog appeared. A manual
+# "post hibernate" test from a shell passes, because nothing is frozen then.
+# So stage one only decides and schedules; stage two is a transient timer in
+# the system manager (never frozen) that fires a few seconds later.
+#
 # systemd waits for system-sleep hooks. Everything here is milliseconds, and
-# the UI is handed off to the user's manager via systemd-run, which returns
-# immediately -- but bound each external call anyway.
-
-[ "${1:-}" = "post" ] || exit 0
+# the handoff returns immediately -- but bound each external call anyway.
 
 STATE=/run/hibernate-resume-warn.count   # tmpfs: survives hibernation (it is RAM), gone on a fresh boot
 UI=/usr/local/bin/hibernate-resume-warn
 PAT='PM: hibernation: hibernation entry'
+DELAY=3                                  # seconds; the thaw is ~0.1 s after the hooks return
 T=""; command -v timeout >/dev/null 2>&1 && T="timeout 5"
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 
-a=$($T dmesg 2>/dev/null | grep -c "$PAT")
-b=$($T journalctl -b -k --no-pager -o cat 2>/dev/null | grep -c "$PAT")
-n=$a; [ "${b:-0}" -gt "$n" ] && n=$b
-prev=$(cat "$STATE" 2>/dev/null || echo 0)
-echo "$n" > "$STATE"
-[ "$n" -gt "$prev" ] || exit 0
+log() { logger -t hibernate-resume-warn -- "$*" 2>/dev/null || :; }
 
-# Every user with a graphical session gets the dialog, via their own
-# systemd --user manager (which carries DISPLAY / WAYLAND_DISPLAY / the
+# Stage two: every user with a graphical session gets the dialog, via their
+# own systemd --user manager (which carries DISPLAY / WAYLAND_DISPLAY / the
 # session bus). --collect keeps a dismissed dialog from lingering as a unit.
-$T loginctl list-sessions --no-legend 2>/dev/null | while read -r sid uid user rest; do
-    case "$($T loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
-        wayland|x11|mir) ;;
-        *) continue ;;
-    esac
-    $T systemd-run --machine="$user@" --user --collect --quiet \
-        --unit="hibernate-resume-warn-$(date +%s)" "$UI" --force || :
-done
+dispatch() {
+    $T loginctl list-sessions --no-legend 2>/dev/null | while read -r sid uid user rest; do
+        case "$($T loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
+            wayland|x11|mir) ;;
+            *) continue ;;
+        esac
+        if $T systemd-run --machine="$user@" --user --collect --quiet \
+                --unit="hibernate-resume-warn-$sid-$(date +%s)" "$UI" --force; then
+            log "dialog started for $user (session $sid)"
+        else
+            log "FAILED to start the dialog for $user (session $sid), rc=$?"
+        fi
+    done
+}
+
+case "${1:-}" in
+    dispatch) dispatch; exit 0 ;;
+    post) ;;
+    *) exit 0 ;;
+esac
+
+if [ "${2:-}" = "test" ]; then
+    log "test mode: skipping the count"
+else
+    a=$($T dmesg 2>/dev/null | grep -c "$PAT")
+    b=$($T journalctl -b -k --no-pager -o cat 2>/dev/null | grep -c "$PAT")
+    n=$a; [ "${b:-0}" -gt "$n" ] && n=$b
+    prev=$(cat "$STATE" 2>/dev/null || echo 0)
+    echo "$n" > "$STATE"
+    [ "$n" -gt "$prev" ] || exit 0
+    log "hibernation images written this boot: $prev -> $n; scheduling the reboot dialog"
+fi
+
+# Hand off to the system manager. If even that fails, try inline: on a
+# systemd that does not freeze user sessions it still works.
+if $T systemd-run --collect --quiet --on-active="$DELAY" \
+        --unit="hibernate-resume-warn-dispatch-$(date +%s)" "$SELF" dispatch; then
+    :
+else
+    log "could not schedule stage two (rc=$?); trying inline"
+    dispatch
+fi
 exit 0
