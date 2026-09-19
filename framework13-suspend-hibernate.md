@@ -1496,10 +1496,14 @@ nothing, and a hibernation resume warns exactly once.
 
 The handoff is **two stages**, and the reason is the subject of the next
 section: the hook itself only counts and, if the count rose, asks the *system*
-manager for a transient timer (`systemd-run --on-active=3 … dispatch`); the
-timer's service, three seconds later, is what walks `loginctl list-sessions`
-and starts the dialog in each session. Both stages log to the journal under
-`hibernate-resume-warn`, so "did it fire?" is a `journalctl -t` away.
+manager for a transient timer (`systemd-run --on-active=3
+--timer-property=AccuracySec=1s … dispatch` — without the accuracy property the
+timer default is a one-minute coalescing window, and "3 s" was arriving at
+5 s). The timer's service waits until `user.slice` reports `FreezerState=running`,
+then walks `loginctl list-sessions`, starts the dialog once per user with a
+graphical session (`Type=exec`, so a failed exec is reported as a failure),
+and retries a few times if no session takes it. Both stages log to the journal
+under `hibernate-resume-warn`, so "did it fire?" is a `journalctl -t` away.
 
 Counting *image creations* rather than *restores* is deliberate: the GPU buffers
 are swapped out when the image is written, so a hybrid-sleep that woke from
@@ -1561,11 +1565,14 @@ tested by hand, and did not appear. `journalctl -b -2 | grep hibernate-resume-wa
 showed the manual test from the day before and nothing at 10:25. The hook had
 no logging of its own, and its one external call was `systemd-run --quiet … || :`.
 
-The cause is in `systemd-sleep` itself. Since v255 it freezes `user.slice` for
-the duration of the sleep — and in `sleep.c` the freeze is in `run()`, the
-`post` hooks are in `execute()`, and the thaw is back in `run()` *after*
-`execute()` returns. Every `post` hook therefore runs while every user session,
-and every user's `systemd --user`, is a frozen cgroup. The timestamps agree:
+The cause is in `systemd-sleep` itself. It freezes `user.slice` for the
+duration of the sleep — v255 did it for suspend-then-hibernate only, inside
+`execute_s2h()`; v256 moved it to `run()` for every operation (it can be
+disabled with `SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=0`, which systemd advises
+against). Either way the `post` hooks are in `execute()`, and the thaw comes
+*after* `execute()` returns. Every `post` hook therefore runs while every user
+session, and every user's `systemd --user`, is a frozen cgroup. The timestamps
+agree:
 
 ```
 10:25:31.431620  systemd-sleep: System returned from sleep operation 'suspend-then-hibernate'.
@@ -2117,8 +2124,9 @@ busctl call org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPowe
     this session come from an image".
 
 26. **`system-sleep` `post` hooks run while every user session is frozen.**
-    `systemd-sleep` (v255+) freezes `user.slice` in `run()`, runs the hooks
-    in `execute()`, and thaws after `execute()` returns — on this machine the
+    `systemd-sleep` freezes `user.slice` (v255: for suspend-then-hibernate;
+    v256+: every operation), runs the hooks in `execute()`, and thaws after
+    `execute()` returns — on this machine the
     hooks had 116 ms between "System returned from sleep" and "thawed unit
     'user.slice'". `systemd-run --user`, `notify-send`, anything over the
     session bus: fails or hangs, and a hand test from a desktop shell passes

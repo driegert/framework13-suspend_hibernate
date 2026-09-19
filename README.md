@@ -344,8 +344,9 @@ plain suspend, and never on a fresh boot.
 It is two stages on purpose. `systemd-sleep` keeps `user.slice` frozen until
 the `post` hooks have *returned*, so a hook cannot reach any user session
 directly — `systemd-run --user` fails, silently if you let it. The hook only
-counts and schedules a 3-second system timer; the timer's service starts the
-dialog after the thaw. Both stages log under `hibernate-resume-warn`:
+counts and schedules a 3-second system timer; the timer's service waits for
+the thaw, then starts the dialog once per user with a graphical session,
+retrying briefly if none takes it. Both stages log under `hibernate-resume-warn`:
 ```sh
 journalctl -b -t hibernate-resume-warn      # "scheduling the reboot dialog" then "dialog started for <user>"
 ```
