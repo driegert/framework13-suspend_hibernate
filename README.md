@@ -342,7 +342,7 @@ journalctl -b -k | grep -E 'Hibernation image restored|list_(del|add) corruption
 **`zz-hibernate-resume-warn` + `hibernate-resume-warn`** turn the first of
 those into something you can't miss: a sleep hook that, after any wake
 following a hibernation image being written this boot, puts a critical
-notification and a **Reboot now / Later** dialog on every graphical session.
+notification and a **Reboot anyway / Keep testing** dialog (**Reboot now / Later** before the fix shipped in 7.0.0-41) on every graphical session.
 The dialog stays until answered. It fires once per hibernation, never on a
 plain suspend, and never on a fresh boot.
 
@@ -687,7 +687,7 @@ ttm-fix-check          # "buggy" = reboot after every hibernation resume, for no
 
 sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/
 sudo install -m 0755 "$D/zz-hibernate-resume-warn" /usr/lib/systemd/system-sleep/
-sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog appears ~3 s later; click Later
+sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog appears ~3 s later; click Keep testing
 journalctl -b -t hibernate-resume-warn                                   # both stages should have logged
 ```
 

@@ -35,19 +35,27 @@ case "$MODE" in
         fi ;;
 esac
 
-TITLE="Reboot before you rely on this session"
+# Since 7.0.0-41 Ubuntu's kernel carries the fix, and the fix needs testing:
+# the session has to keep running after a resume. So the dialog now says to
+# skip the reboot, and "Keep testing" is the default button. Revert to the
+# old wording if the bug ever comes back.
+TITLE="Hibernation resume: don't reboot, we're testing the fix"
 BODY="This session has been through a hibernation (${N} image$( [ "$N" -ne 1 ] && echo s) written this boot). \
-On kernel $(uname -r) that arms a known GPU-driver bug (drm/ttm bulk_move) that can lock the machine up \
-minutes to hours later, whatever you are doing. A reboot clears it; a plain suspend does not re-arm it."
+Kernel $(uname -r) has the fix for the GPU-driver bug (drm/ttm bulk_move) that used to lock the machine up \
+after this, and the fix needs hours of normal use after a resume to be confirmed. \
+Choose Keep testing and carry on as usual. Save your work a little more often than normal. \
+If the machine freezes or reboots by itself, that is the result we need: note the time."
 
 # Critical-urgency notifications are not auto-dismissed by GNOME Shell and
 # survive the lock screen, so this is visible right after unlocking.
-notify-send -a hibernate-resume-warn -u critical -i system-reboot "$TITLE" "$BODY" 2>/dev/null || :
+notify-send -a hibernate-resume-warn -u critical -i dialog-information "$TITLE" "$BODY" 2>/dev/null || :
 
 if command -v zenity >/dev/null 2>&1; then
-    if zenity --question --title="$TITLE" --width=460 --icon=system-reboot \
-              --text="<b>$TITLE</b>\n\n$BODY\n\nRun <tt>ttm-fix-check</tt> to see whether a fixed kernel has shipped." \
-              --ok-label="Reboot now" --cancel-label="Later" 2>/dev/null; then
+    # OK = reboot, Cancel/Esc/close = keep testing, so dismissing it any other
+    # way never reboots. --default-cancel puts the focus on "Keep testing".
+    if zenity --question --title="$TITLE" --width=460 --icon=dialog-information --default-cancel \
+              --text="<b>$TITLE</b>\n\n$BODY\n\nReboot only if you can't risk a freeze right now (an exam, a lecture)." \
+              --ok-label="Reboot anyway" --cancel-label="Keep testing" 2>/dev/null; then
         systemctl reboot
     fi
 else
