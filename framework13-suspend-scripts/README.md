@@ -79,7 +79,8 @@ suspend-report
 
 # 9. drm/ttm bulk_move bug watch (Part 9 of the write-up): tells you when a
 #    kernel without the hibernate-resume lockup is available / running.
-#    Until it says "fixed": reboot after any hibernation resume.
+#    If it says "buggy" (7.0.0-28 … -38): reboot after any hibernation resume.
+#    Ubuntu 7.0.0-41 and later are "fixed".
 install -m 0755 "$D/ttm-fix-check" ~/.local/bin/ttm-fix-check
 install -D -m 0644 "$D/ttm-fix-check.service" ~/.config/systemd/user/ttm-fix-check.service
 install -D -m 0644 "$D/ttm-fix-check.timer"   ~/.config/systemd/user/ttm-fix-check.timer
@@ -87,8 +88,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now ttm-fix-check.timer
 ttm-fix-check
 
-# 10. persistent "reboot me" dialog after any wake that follows a hibernation
-#     image being written (Part 9). Counts image creations in this boot; the
+# 10. persistent dialog after any wake that follows a hibernation image being
+#     written (Part 9). It was a "reboot me" dialog; since the fix shipped it
+#     says to keep the session running so the fix gets tested.
+#     Counts image creations in this boot; the
 #     root-side hook hands the UI to your systemd --user manager.
 sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/hibernate-resume-warn
 sudo install -m 0755 "$D/zz-hibernate-resume-warn" /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn

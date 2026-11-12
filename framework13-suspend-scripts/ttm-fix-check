@@ -28,9 +28,44 @@ changelog_for() {              # $1 = ABI version like 7.0.0-31.31
     printf '%s' "$f"
 }
 
-status_of() {                  # prints: fixed | buggy | clean | unknown
+# The upstream fix landed in two parts. 3db7d7d58341 put its one-line change
+# on the wrong `if` (the dmem charge check in ttm_bo_alloc_at_place), and
+# fcfe64715b42 moved it to the right one (after ttm_tt_swapout in
+# ttm_bo_swapout_cb). A changelog line for 3db7d7d58341 alone can't tell the
+# two apart, so read the shipped ttm_bo.c from Ubuntu's git at the release tag.
+SRC_REPO=https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute
+source_for() {                 # $1 = version like 7.0.0-42.42
+    local f="$CACHE/$1.ttm_bo.c"
+    if [ ! -s "$f" ]; then
+        curl -sfL --max-time 60 \
+            "$SRC_REPO/plain/drivers/gpu/drm/ttm/ttm_bo.c?h=Ubuntu-$1" \
+            -o "$f.tmp" && mv "$f.tmp" "$f" || { rm -f "$f.tmp"; return 1; }
+    fi
+    printf '%s' "$f"
+}
+
+source_check() {               # prints: ok | misapplied | unknown
+    local f; f=$(source_for "$1") || { echo unknown; return; }
+    awk '
+        /ret = ttm_tt_swapout\(/        { sw = 1; next }
+        sw && /if \(/                   { swap = ($0 ~ /ret > 0/) ? "ok" : "bad"; sw = 0 }
+        /ttm_resource_try_charge\(bo/   { ch = 1; next }
+        ch && /if \(/                   { if ($0 ~ /ret > 0/) charge = "bad"; ch = 0 }
+        END {
+            if (swap == "")                         print "unknown"
+            else if (swap == "ok" && charge != "bad") print "ok"
+            else                                     print "misapplied"
+        }' "$f"
+}
+
+status_of() {                  # prints: fixed | misapplied | buggy | clean | unknown
     local f; f=$(changelog_for "$1") || { echo unknown; return; }
-    if   grep -qF "$FIX" "$f"; then echo fixed
+    if grep -qF "$FIX" "$f"; then
+        case $(source_check "$1") in
+            ok)         echo fixed ;;
+            misapplied) echo misapplied ;;   # only the first, misplaced half
+            *)          echo "fixed(changelog-only)" ;;
+        esac
     elif grep -qF "$BUG" "$f"; then echo buggy
     else                            echo clean       # predates the bad commit
     fi
@@ -57,6 +92,9 @@ if [ "$KEY" != "$LAST" ]; then
     if [ "$RUN_ST" = fixed ]; then
         notify normal "TTM hibernate fix is in the running kernel" \
             "$RUNNING contains '$FIX'. Hibernation before class is safe again."
+    elif [ "$RUN_ST" = misapplied ]; then
+        notify critical "TTM fix in $RUNNING is misapplied" \
+            "The changelog lists the fix, but ttm_bo.c lacks the follow-up (fcfe64715b42). Keep rebooting after hibernate."
     elif [ "$CAND_ST" = fixed ]; then
         notify critical "Kernel with the TTM hibernate fix is available" \
             "$PKG $CANDIDATE contains the fix; running $RUNNING does not. Upgrade and reboot."

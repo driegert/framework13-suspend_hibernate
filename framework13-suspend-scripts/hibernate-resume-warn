@@ -1,8 +1,10 @@
 #!/bin/bash
-# Warn, loudly and persistently, that this session has been through a
-# hibernation and should be rebooted before doing anything that matters.
+# Tell the user, loudly and persistently, that this session has been through
+# a hibernation. On a kernel with the drm/ttm bug that meant "reboot before
+# doing anything that matters". Ubuntu fixed it in 7.0.0-41, so the dialog now
+# says the opposite: keep the session running, so the fix gets tested.
 #
-# Why: on Ubuntu kernels 7.0.0-28 .. (see Part 9 of the write-up) every GPU
+# Why it mattered: on Ubuntu kernels 7.0.0-28 .. -38 (see Part 9 of the write-up) every GPU
 # buffer swapped out while writing a hibernation image is left on a dangling
 # bulk_move cursor after resume. Freeing one and allocating again corrupts the
 # TTM LRU; the machine locks up minutes to hours later. A fresh boot has no such

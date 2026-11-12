@@ -43,7 +43,7 @@ non-obvious traps that cost the most time.
 | Emergency hibernate reserve | 2% of battery (packaged default) | **7%** |
 | Hibernating on a stale kernel | silently lost the session **and** 72% of the battery | lid plain-suspends until you reboot |
 | WiFi back after hibernate resume | ~18 s (MT7922 firmware reload) | **~4 s** (AX210, clean restore) |
-| Resume from hibernation on 7.0.0-28 … -38 (at least) | can lock the machine minutes–hours later (upstream drm/ttm bug) | **reboot after a hibernation resume** until the fix ships; `ttm-fix-check` says when |
+| Resume from hibernation on 7.0.0-28 … -38 | can lock the machine minutes–hours later (upstream drm/ttm bug) | **fixed in 7.0.0-41**; no recurrence on -42/-43 as of 2026-11-12, still under observation. On an older kernel, reboot after a hibernation resume; `ttm-fix-check` says which you have |
 
 **Day-to-day behaviour now**
 
@@ -54,7 +54,7 @@ non-obvious traps that cost the most time.
 - Unplugging the charger no longer wakes it — the original complaint
 - Battery critically low while awake → hibernates at 7%, with enough charge left to finish writing the image
 - **A kernel was installed but not yet booted** → lid closed *plain-suspends* instead of hibernating, until you reboot ([Part 7](#part-7--the-kernel-upgrade-trap))
-- **Resumed from a hibernation image** → reboot before doing anything that matters, until Ubuntu ships the drm/ttm fix ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)). A plain suspend afterwards is fine.
+- **Resumed from a hibernation image** → on 7.0.0-41 and later, carry on; the drm/ttm fix is in and being tested ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)). On 7.0.0-28 … -38, reboot before doing anything that matters. A plain suspend afterwards is fine.
 - **A panic while an image is on disk** → the kdump capture kernel currently erases the image ([Part 10](#part-10--part-8s-panic-named--and-the-capture-kernel-that-ate-the-image)); stay on AC when the session matters so the 7% emergency hibernate never fires.
 
 ---
@@ -63,7 +63,7 @@ non-obvious traps that cost the most time.
 
 ```
 Framework 13, AMD Ryzen 7 7840U
-Ubuntu 26.04 LTS, kernel 7.0.0-31-generic (7.0.0-29 when first written), systemd 259, GNOME/Wayland
+Ubuntu 26.04 LTS, kernel 7.0.0-43-generic (7.0.0-29 when first written; Parts 9–10 happened on 7.0.0-31), systemd 259, GNOME/Wayland
 BIOS 03.20 (all firmware current per fwupdmgr)
 Secure Boot: disabled     kernel lockdown: [none]
 RAM: 59.4 GiB             page size: 4096
@@ -1433,13 +1433,16 @@ this document was written against:
 | 7.0.0-26 | ≤ 7.0.9 | no |
 | 7.0.0-28 | 7.0.10 – 7.0.12 | **yes** — first affected |
 | 7.0.0-30, 7.0.0-31 | up to 7.0.14 | **yes** |
+| 7.0.0-34, 7.0.0-38 | not checked | **yes** (crashed on -34; -38 changelog has the bad commit, not the fix) |
+| 7.0.0-41 and later | not checked | no — **fixed** (added 2026-11-12; see [the fix arrives](#the-fix-arrives-700-41-and-where-it-stands-on-2026-11-12)) |
 
 The fix is a one-liner — `if (!ret)` → `if (ret > 0)` — landed in
 `drm-misc-fixes` on 2026-09-09 as `drm/ttm: fix swapped-out resources never
 leaving their bulk_move range` (`3db7d7d58341`) plus a follow-up
 `drm/ttm: apply the swapout bulk_move fix to the intended condition`
-(`fcfe64715b42`), both tagged `Cc: stable`. As of 2026-09-18 it is **not in
-mainline, not in any stable release, and not in Ubuntu.** You can check the
+(`fcfe64715b42`), both tagged `Cc: stable`. As of 2026-09-18 it was **not in
+mainline, not in any stable release, and not in Ubuntu.** (Ubuntu shipped it in
+7.0.0-41.) You can check the
 changelog yourself; the changelog Ubuntu ships in
 `/usr/share/doc/linux-image-*/` is truncated, so fetch the full one:
 
@@ -1638,15 +1641,16 @@ consequences:
 
 Fix (2026-10-03): moved both hooks to `/usr/lib/systemd/system-sleep/`. All install
 commands in this repo now use that path. `zz-hibernate-resume-warn post test` from the new
-location launched the dialog in 4 s. **Still not verified:** that systemd runs them on a
-real sleep. Close and reopen the lid, then look for a `framework-wakeup-policy: disarmed …`
-line stamped at the moment of the sleep.
+location launched the dialog in 4 s. **Verified since on real sleeps:**
+`framework-wakeup-policy: disarmed …` is now logged in the same second as each
+`Performing sleep operation` line, and `hibernate-resume-warn` logged and launched its dialog
+at the hibernation resumes of Nov 5, Nov 6 and Nov 12.
 
 Two other findings from the same crash:
 
 - **7.0.0-38 still carries the bug.** Its changelog contains `Fix ttm_bo_swapout() infinite
   LRU walk` but not the fix, and `ttm-fix-check` reports `buggy / buggy`. Keep rebooting after
-  any image is written.
+  any image is written. (The fix came in 7.0.0-41; see the next section.)
 - **The 10:54 hybrid-sleep didn't come from the lid.** logind logged `The system will hybrid
   sleep now!` with no `Lid closed` or power-key event, and nothing in the lid config picks
   hybrid-sleep. It's an explicit request from something not yet identified (the only other
@@ -1655,6 +1659,46 @@ Two other findings from the same crash:
 
 The full crash record is in the separate `framework13-issues` repo,
 `issues/2026-09-27-amdgpu-ttm-lru-corruption-panic.md`.
+
+### The fix arrives (7.0.0-41), and where it stands on 2026-11-12
+
+Ubuntu shipped `drm/ttm: fix swapped-out resources never leaving their bulk_move range` in
+7.0.0-41. This machine ran 7.0.0-42 from Oct 29 and has run 7.0.0-43 since Nov 11.
+`ttm-fix-check` reports `fixed / fixed`.
+
+The follow-up commit `fcfe64715b42` isn't in Ubuntu's changelog. That matters upstream, where
+the first commit put its one-line change on the wrong `if` and the follow-up moved it. It
+doesn't matter here: the code the wrong `if` belongs to (the dmem charge check) isn't in the
+7.0 tree, so Ubuntu's backport could only land on the right one. `ttm_bo.c` at tag
+`Ubuntu-7.0.0-42.42` has `if (ret > 0)` after `ttm_tt_swapout()`. `ttm-fix-check` now reads
+that file at the release tag as well as the changelog, and reports `misapplied` if a kernel
+ever ships only the misplaced half.
+
+Four hibernation resumes on fixed kernels so far:
+
+| Image written, resumed | Kernel | Time run after resume | `list_del corruption` | `non-zero when fini` lines |
+|---|---|---|---|---|
+| Oct 31 12:44, 12:57 | -42 | 3 min (rebooted) | none | 12 |
+| Nov 4 14:25, Nov 5 07:55 | -42 | 4 min (rebooted) | none | 14 |
+| Nov 5 16:11, Nov 6 07:52 | -42 | **2 h 01 min** | none | 14 |
+| Nov 11 14:05, Nov 12 07:23 | -43 | 2 min (rebooted) | none | 8 |
+
+There has been no list corruption, no `ttm_lru_bulk_move_tail` fault and no panic. The
+`amdgpu: VM memory stats for proc … is non-zero when fini` lines that used to come before the
+corruption still follow every hibernation, and never appear on a boot that didn't hibernate.
+The likely reading is that they're a separate, cosmetic accounting drift in amdgpu, but that
+hasn't been confirmed from source.
+
+The fix is still thinly tested. Three of the four resumes were rebooted within minutes,
+because the dialog was still saying "Reboot now". So on 2026-11-12 the dialog was reworded:
+it now says not to reboot, **Keep testing** is the default button, and only **Reboot anyway**
+reboots. The rule from "The decision" above is suspended on 7.0.0-41 and later. It still
+applies on -28 through -38.
+
+One unexplained event since, which isn't this bug: on Nov 6 at 17:04 the laptop entered s2idle
+on battery and never logged a resume or the 2-hour hibernate step. It was next booted on
+Nov 11, with an unclean filesystem journal. Either the RTC wake didn't happen and the battery
+ran out, or the machine hung on the wake. It has happened once.
 
 ---
 
@@ -1829,7 +1873,7 @@ capture-kernel boot after a hibernation as a lost session.
 | `/etc/UPower/UPower.conf.d/10-hibernate-reserve.conf` | Raises the emergency-hibernate battery floor from 2% to 7% (see [Part 6](#part-6--a-lost-session-diagnosed)) |
 | `/etc/default/kdump-tools` | `KDUMP_CMDLINE_APPEND=… noresume module_blacklist=…` — keeps the capture kernel off the resume path and away from the audio/WiFi/GPU drivers that have twice panicked it (see [Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)). Packaged conffile, edited in place; timestamped `.bak-` alongside. |
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
-| `~/.local/bin/ttm-fix-check` | Classifies the running kernel and the apt candidate as clean / buggy / fixed for the drm/ttm bulk_move bug, from the Ubuntu changelog; notifies on change ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)) |
+| `~/.local/bin/ttm-fix-check` | Classifies the running kernel and the apt candidate as clean / buggy / fixed / misapplied for the drm/ttm bulk_move bug, from the Ubuntu changelog and the shipped `ttm_bo.c`; notifies on change ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)) |
 | `~/.config/systemd/user/ttm-fix-check.{service,timer}` | Runs it daily (`Persistent=true`) |
 | `/usr/lib/systemd/system-sleep/zz-hibernate-resume-warn` | `post`-phase sleep hook: if this boot has written a hibernation image since the last wake, schedules a 3 s system timer that launches the warning in every graphical user's session — two stages, because the hook runs while `user.slice` is still frozen ([Part 9](#second-occurrence-2026-09-19--and-the-warning-that-never-fired)). State in `/run/hibernate-resume-warn.count`; logs as `hibernate-resume-warn`. |
 | `/usr/local/bin/hibernate-resume-warn` | The warning itself: critical notification + zenity dialog. Since 2026-11-12 it says not to reboot, so the 7.0.0-41+ fix gets tested: **Reboot anyway / Keep testing**, with Keep testing as the default (it was **Reboot now / Later**). `--quiet` prints this boot's image count; no args warns only if it is > 0. |
@@ -1854,14 +1898,16 @@ crash_kexec_post_notifiers = Y  (efi_pstore records the panic BEFORE the kexec
                            jump). VERIFIED 2026-08-25: pstore record at kernel
                            uptime 7497 s = the real kernel, not the capture one.
 WiFi                     = Intel AX210 (iwlwifi), ~4 s to activated after resume
-kernel 7.0.0-31          = carries the drm/ttm bulk_move bug (Part 9); fix not
-                           yet in Ubuntu. ttm-fix-check.timer enabled, reports
-                           "buggy / buggy". Operating rule: reboot after any
-                           hibernation resume.
-                           2026-10-02: 7.0.0-38 is still "buggy / buggy".
+kernel 7.0.0-43          = has the drm/ttm bulk_move fix (Part 9), shipped in
+                           7.0.0-41. ttm-fix-check reports "fixed / fixed".
+                           No recurrence in 4 hibernation resumes as of
+                           2026-11-12; under observation. The reboot-after-
+                           resume rule is suspended; the dialog now says
+                           "Keep testing". 7.0.0-28 … -38 were "buggy".
 sleep hooks              = in /usr/lib/systemd/system-sleep/ since 2026-10-03.
                            systemd 259 never ran them from /etc/ (Part 9,
-                           third occurrence). Post test PASS 2026-10-03.
+                           third occurrence). Seen running on real sleeps
+                           and resumes since (Nov 5, 6, 12).
 kdump capture cmdline    = still activates swap from fstab and ERASES a pending
                            hibernation image (Part 10). Fix proposed, not applied.
 ```
@@ -1967,8 +2013,8 @@ sudo cat /var/lib/systemd/pstore/<epoch-prefix>*/*/dmesg.txt \
   | grep -E '^<[0-9]>\[' | sort -t']' -k1,1 -s | sed 's/^<[0-9]>//' \
   | grep -vE '^\[[0-9. ]+\]  ?\? '          # drop the "? maybe-frame" noise
 
-# DID THIS SESSION COME BACK FROM A HIBERNATION IMAGE?  (yes -> reboot before
-# anything that matters, until the drm/ttm fix ships; see Part 9)
+# DID THIS SESSION COME BACK FROM A HIBERNATION IMAGE?  (yes, and ttm-fix-check
+# says "buggy" -> reboot before anything that matters; see Part 9)
 journalctl -b -k | grep -c 'Hibernation image restored successfully'
 hibernate-resume-warn --quiet          # same question, counting images WRITTEN this boot
 sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake; dialog iff count rose
@@ -2151,11 +2197,11 @@ busctl call org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPowe
     *earlier* than the warning — here, a hibernation resume four minutes before.
 
 22. **Resuming from hibernation is not the end of the hibernation's effects.**
-    On Ubuntu kernels `7.0.0-28` through at least `-31`, every GPU buffer swapped
+    On Ubuntu kernels `7.0.0-28` through `-38`, every GPU buffer swapped
     out for the image stays on a bulk-move cursor after resume, and freeing one
-    leaves the cursor dangling (upstream drm/ttm bug, fix queued 2026-09-09,
-    not shipped). The crash comes minutes to hours later, from whatever process
-    next submits GPU work. Until the fix lands: reboot after a hibernation
+    leaves the cursor dangling (upstream drm/ttm bug, fixed in Ubuntu 7.0.0-41).
+    The crash comes minutes to hours later, from whatever process
+    next submits GPU work. On an affected kernel: reboot after a hibernation
     resume. Only hibernation swaps GPU buffers out; s2idle does not.
 
 23. **The kdump capture kernel activates swap from `/etc/fstab`, and `swapon`
@@ -2443,8 +2489,9 @@ It is a driver bug, outside this repository's reach.
 resuming from hibernation on any Ubuntu kernel since `7.0.0-28` arms a known
 drm/ttm use-after-free that locked the machine an hour after a clean resume
 ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)).
-The upstream fix is queued but unshipped; until `ttm-fix-check` says
-otherwise, the rule is *reboot after a hibernation resume*. Second, the kdump
+Ubuntu shipped the fix in 7.0.0-41, and four hibernation resumes on -42 and -43
+have been clean as of 2026-11-12. Only one was followed by hours of use, so it
+stays under observation. Second, the kdump
 capture kernel erases a pending hibernation image by activating swap from
 `fstab` — a fix is proposed in Part 10 and not yet applied. Everything else
 remains as verified on 08-25: the wake-source policy, the swap partition,

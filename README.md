@@ -4,7 +4,7 @@ Scripts and config to stop a Framework 13 (AMD Ryzen 7840U) draining its
 battery while it's supposed to be asleep, on Ubuntu.
 
 Developed on a Framework 13 AMD / Ryzen 7 7840U running Ubuntu 26.04, kernel
-7.0.0-30 (now 7.0.0-31), systemd 259, GNOME/Wayland. Most of it applies to any AMD Framework;
+7.0.0-30 (now 7.0.0-43), systemd 259, GNOME/Wayland. Most of it applies to any AMD Framework;
 the parts that don't are called out in [Portability](#portability).
 
 **Result on the test machine:**
@@ -312,22 +312,25 @@ Not a sleep fix — a watch for a kernel bug that turns a *successful* hibernati
 resume into a lockup minutes to hours later, on AMD APUs running Ubuntu kernels
 `7.0.0-28` and later (upstream drm/ttm: buffers swapped out for the image are
 never removed from their bulk-move range; freeing one after resume leaves a
-dangling cursor; the next GPU submission faults). Fix queued upstream
-2026-09-09, not shipped as of 2026-09-19. Details and the evidence in Part 9 of
-the write-up.
+dangling cursor; the next GPU submission faults). **Ubuntu shipped the fix in
+7.0.0-41.** On this machine it has held through four hibernation resumes on -42
+and -43 as of 2026-11-12, and is still under observation. Details and the
+evidence in Part 9 of the write-up.
 
-Until it ships, the only prevention is **reboot after any hibernation resume**
-before doing anything you'd mind losing. This script tells you when to stop:
+On `7.0.0-28` through `-38`, the only prevention is **reboot after any
+hibernation resume** before doing anything you'd mind losing. This script tells
+you which kind of kernel you have:
 
 ```sh
 ttm-fix-check
-# running   7.0.0-31.31    buggy
-# candidate 7.0.0-31.31    buggy
-# No fix yet — keep rebooting before class.
+# running   7.0.0-43.43    fixed
+# candidate 7.0.0-43.43    fixed
+# (on an affected kernel: "buggy", and "No fix yet — keep rebooting before class.")
 ```
 
 It fetches the Ubuntu changelog for the running kernel and the apt candidate,
-classifies each as *clean / buggy / fixed* by commit title, and sends a desktop
+classifies each as *clean / buggy / fixed* by commit title, confirms a `fixed`
+against the shipped `ttm_bo.c` (`misapplied` if only half the fix is there), and sends a desktop
 notification once when a fixed kernel becomes available and once when it is the
 one running. The timer runs it daily. Ubuntu-specific (changelog URLs and
 package name); adapt `PKG` if you are not on the HWE kernel.
@@ -342,7 +345,10 @@ journalctl -b -k | grep -E 'Hibernation image restored|list_(del|add) corruption
 **`zz-hibernate-resume-warn` + `hibernate-resume-warn`** turn the first of
 those into something you can't miss: a sleep hook that, after any wake
 following a hibernation image being written this boot, puts a critical
-notification and a **Reboot anyway / Keep testing** dialog (**Reboot now / Later** before the fix shipped in 7.0.0-41) on every graphical session.
+notification and a dialog on every graphical session. As shipped here the
+dialog is worded for a fixed kernel: it says not to reboot, so the fix gets
+tested, with **Reboot anyway / Keep testing** buttons. On an affected kernel,
+use the **Reboot now / Later** wording from before commit `bc56f1c`.
 The dialog stays until answered. It fires once per hibernation, never on a
 plain suspend, and never on a fresh boot.
 
@@ -683,7 +689,7 @@ install -D -m 0644 "$D/ttm-fix-check.service" ~/.config/systemd/user/
 install -D -m 0644 "$D/ttm-fix-check.timer"   ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ttm-fix-check.timer
-ttm-fix-check          # "buggy" = reboot after every hibernation resume, for now
+ttm-fix-check          # "buggy" = reboot after every hibernation resume; "fixed" (7.0.0-41+) = no need
 
 sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/
 sudo install -m 0755 "$D/zz-hibernate-resume-warn" /usr/lib/systemd/system-sleep/

@@ -1,7 +1,9 @@
 #!/bin/sh
 # /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn
 # After every wake, if this boot has written a hibernation image since the
-# last wake, tell every graphical user to reboot (see Part 9 of the write-up).
+# last wake, put the hibernate-resume-warn dialog in every graphical session
+# (see Part 9 of the write-up). The dialog said "reboot" on kernels with the
+# drm/ttm bug; on 7.0.0-41+ it says to keep going, to test the fix.
 # $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate|...
 #   also:  post test   skip the counting, fire unconditionally (for testing)
 #          dispatch    stage two (below); runs from a transient system unit
