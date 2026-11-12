@@ -13,7 +13,7 @@ without root — diff them if you want to be sure).
 |---|---|
 | `framework-wakeup-policy` | `/usr/local/sbin/framework-wakeup-policy` (0755) |
 | `framework-wakeup-policy.service` | `/etc/systemd/system/` (0644) |
-| `framework-wakeup-policy.sleep` | `/etc/systemd/system-sleep/framework-wakeup-policy` (0755) |
+| `framework-wakeup-policy.sleep` | `/usr/lib/systemd/system-sleep/framework-wakeup-policy` (0755) |
 | `10-enable-hibernate.rules` | `/etc/polkit-1/rules.d/` (0644) |
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) |
 | `10-lid-sleep.conf` | `/etc/systemd/logind.conf.d/` (0644) |
@@ -25,7 +25,7 @@ without root — diff them if you want to be sure).
 | `ttm-fix-check` | `~/.local/bin/` (0755) |
 | `ttm-fix-check.service` + `.timer` | `~/.config/systemd/user/` (0644); user timer, daily |
 | `hibernate-resume-warn` | `/usr/local/bin/` (0755); runs as the user |
-| `zz-hibernate-resume-warn` | `/etc/systemd/system-sleep/` (0755); sleep hook, `post` phase |
+| `zz-hibernate-resume-warn` | `/usr/lib/systemd/system-sleep/` (0755); sleep hook, `post` phase |
 | `crash-evidence-setup.sh` | run once with sudo; not installed. Edits `/etc/default/grub` + `/etc/default/kdump-tools`. |
 | `kdump-noresume.sh` | **superseded** by the above; kept for reference |
 | `setup-hibernate.sh` | run once with sudo; not installed |
@@ -39,7 +39,7 @@ D=$PWD
 # 1. wake-source policy
 sudo install -m 0755 "$D/framework-wakeup-policy"          /usr/local/sbin/framework-wakeup-policy
 sudo install -D -m 0644 "$D/framework-wakeup-policy.service" /etc/systemd/system/framework-wakeup-policy.service
-sudo install -D -m 0755 "$D/framework-wakeup-policy.sleep" /etc/systemd/system-sleep/framework-wakeup-policy
+sudo install -D -m 0755 "$D/framework-wakeup-policy.sleep" /usr/lib/systemd/system-sleep/framework-wakeup-policy
 sudo systemctl daemon-reload
 sudo systemctl enable --now framework-wakeup-policy.service
 
@@ -91,9 +91,9 @@ ttm-fix-check
 #     image being written (Part 9). Counts image creations in this boot; the
 #     root-side hook hands the UI to your systemd --user manager.
 sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/hibernate-resume-warn
-sudo install -m 0755 "$D/zz-hibernate-resume-warn" /etc/systemd/system-sleep/zz-hibernate-resume-warn
+sudo install -m 0755 "$D/zz-hibernate-resume-warn" /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn
 hibernate-resume-warn --quiet          # prints this boot's count; 0 = fresh boot
-sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake
+sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake
 ```
 
 ## The ones that bite

@@ -105,7 +105,7 @@ nodes). If it reports 20-something today, this repo is for you.
 |---|---|---|
 | `framework-wakeup-policy` | `/usr/local/sbin/` (0755) | ✅ as-is |
 | `framework-wakeup-policy.service` | `/etc/systemd/system/` (0644) | ✅ as-is |
-| `framework-wakeup-policy.sleep` | `/etc/systemd/system-sleep/framework-wakeup-policy` (0755) | ✅ as-is |
+| `framework-wakeup-policy.sleep` | `/usr/lib/systemd/system-sleep/framework-wakeup-policy` (0755) | ✅ as-is |
 | `setup-hibernate.sh` | run once with sudo, not installed | ⚠️ pick `--file` or `--partition`, check size |
 | `10-enable-hibernate.rules` | `/etc/polkit-1/rules.d/` (0644) | ⚠️ Ubuntu-specific |
 | `10-hibernate-delay.conf` | `/etc/systemd/sleep.conf.d/` (0644) | ✅ tune to taste |
@@ -119,9 +119,14 @@ nodes). If it reports 20-something today, this repo is for you.
 | `suspend-report` | `~/.local/bin/` (0755) | ⚠️ edit battery model |
 | `ttm-fix-check` + `.service` + `.timer` | `~/.local/bin/`, `~/.config/systemd/user/` | ⚠️ Ubuntu changelog URLs; edit `PKG` for a non-HWE kernel |
 | `hibernate-resume-warn` | `/usr/local/bin/` (0755) | ✅ needs `notify-send`; `zenity` optional |
-| `zz-hibernate-resume-warn` | `/etc/systemd/system-sleep/` (0755) | ✅ as-is |
+| `zz-hibernate-resume-warn` | `/usr/lib/systemd/system-sleep/` (0755) | ✅ as-is |
 
 All of it lives in [`framework13-suspend-scripts/`](framework13-suspend-scripts/).
+
+> **Sleep hooks go in `/usr/lib/systemd/system-sleep/`, not `/etc/systemd/system-sleep/`.**
+> systemd 259 on Ubuntu 26.04 only runs hooks from `/usr/lib/…`. A hook in `/etc/…` is
+> silently ignored, even though calling it by hand works. Check with
+> `man systemd-suspend.service` on your system. Until 2026-10-03 this repo said `/etc/`.
 
 ### Part 1 — `framework-wakeup-policy`
 
@@ -483,7 +488,7 @@ D="$PWD/framework13-suspend-scripts"
 ```sh
 sudo install    -m 0755 "$D/framework-wakeup-policy"         /usr/local/sbin/framework-wakeup-policy
 sudo install -D -m 0644 "$D/framework-wakeup-policy.service" /etc/systemd/system/framework-wakeup-policy.service
-sudo install -D -m 0755 "$D/framework-wakeup-policy.sleep"   /etc/systemd/system-sleep/framework-wakeup-policy
+sudo install -D -m 0755 "$D/framework-wakeup-policy.sleep"   /usr/lib/systemd/system-sleep/framework-wakeup-policy
 sudo systemctl daemon-reload
 sudo systemctl enable --now framework-wakeup-policy.service
 ```
@@ -681,8 +686,8 @@ systemctl --user enable --now ttm-fix-check.timer
 ttm-fix-check          # "buggy" = reboot after every hibernation resume, for now
 
 sudo install -m 0755 "$D/hibernate-resume-warn"    /usr/local/bin/
-sudo install -m 0755 "$D/zz-hibernate-resume-warn" /etc/systemd/system-sleep/
-sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog appears ~3 s later; click Later
+sudo install -m 0755 "$D/zz-hibernate-resume-warn" /usr/lib/systemd/system-sleep/
+sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog appears ~3 s later; click Later
 journalctl -b -t hibernate-resume-warn                                   # both stages should have logged
 ```
 
@@ -826,7 +831,7 @@ More diagnostics — and the reasoning behind all of it — in
 # Wake-source policy
 sudo systemctl disable --now framework-wakeup-policy.service
 sudo rm /etc/systemd/system/framework-wakeup-policy.service \
-        /etc/systemd/system-sleep/framework-wakeup-policy \
+        /usr/lib/systemd/system-sleep/framework-wakeup-policy \
         /usr/local/sbin/framework-wakeup-policy
 sudo systemctl daemon-reload
 

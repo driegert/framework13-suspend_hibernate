@@ -1,5 +1,5 @@
 #!/bin/sh
-# /etc/systemd/system-sleep/zz-hibernate-resume-warn
+# /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn
 # After every wake, if this boot has written a hibernation image since the
 # last wake, tell every graphical user to reboot (see Part 9 of the write-up).
 # $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate|...

@@ -43,7 +43,7 @@ non-obvious traps that cost the most time.
 | Emergency hibernate reserve | 2% of battery (packaged default) | **7%** |
 | Hibernating on a stale kernel | silently lost the session **and** 72% of the battery | lid plain-suspends until you reboot |
 | WiFi back after hibernate resume | ~18 s (MT7922 firmware reload) | **~4 s** (AX210, clean restore) |
-| Resume from hibernation on 7.0.0-28 … -31 | can lock the machine minutes–hours later (upstream drm/ttm bug) | **reboot after a hibernation resume** until the fix ships; `ttm-fix-check` says when |
+| Resume from hibernation on 7.0.0-28 … -38 (at least) | can lock the machine minutes–hours later (upstream drm/ttm bug) | **reboot after a hibernation resume** until the fix ships; `ttm-fix-check` says when |
 
 **Day-to-day behaviour now**
 
@@ -1601,6 +1601,61 @@ any `system-sleep` hook that wants to reach a user: **you are not in the
 session, you are in the 100 ms before it exists again.** Decide in the hook;
 act from a timer.
 
+### Third occurrence (2026-10-01): the hook had never run at all
+
+The reasoning above about the frozen `user.slice` is correct, and the two-stage design is
+still needed. But it wasn't why the Sep 19 dialog never appeared. On the third crash, the
+dialog didn't appear either, even though the two-stage hook was installed. A fresh boot at
+09:01 went into hybrid-sleep at 10:54 (which writes an image, so the bug was armed) and woke
+at 12:04. There was no dialog. The machine died at about 12:44 with the usual pair:
+`list_del corruption`, then `ttm_lru_bulk_move_tail`, both in `Comm: nautilus`. kdump was
+loaded but saved nothing. Only pstore had the trace (see Part 8).
+
+`journalctl | grep hibernate-resume-warn` showed only the manual tests: Sep 18, Sep 19 and
+nothing since. That meant the hook had never written a single line during a real sleep, not
+even the stage-one "images written this boot: 0 -> 1". Checking the other hook,
+`framework-wakeup-policy`, against the last 12 `Performing sleep operation` lines gave the
+same result: it only ever logged at boot, from its service, and never at sleep time. The
+reason:
+
+```
+$ strings /usr/lib/systemd/systemd-sleep | grep system-sleep
+/usr/lib/systemd/system-sleep
+$ man systemd-suspend.service
+  ... will run all executables in /usr/lib/systemd/system-sleep/ ...
+```
+
+**systemd 259 as packaged for Ubuntu 26.04 only reads `/usr/lib/systemd/system-sleep/`.**
+Both hooks had been in `/etc/systemd/system-sleep/` since they were written, so neither
+ever ran. Manual tests passed because they call the script by its path. The other
+consequences:
+
+- The pre-sleep re-apply of the wake-source policy has never happened. The boot-time
+  service did all the work. The 0-spurious-wakes result in the summary is still real, but
+  it came from the service alone. Watch for USB/UCSI drift returning over a long uptime.
+- The Sep 19 analysis above was right about the freeze but wrong about the cause: the
+  "116 ms window" was never reached.
+
+Fix (2026-10-03): moved both hooks to `/usr/lib/systemd/system-sleep/`. All install
+commands in this repo now use that path. `zz-hibernate-resume-warn post test` from the new
+location launched the dialog in 4 s. **Still not verified:** that systemd runs them on a
+real sleep. Close and reopen the lid, then look for a `framework-wakeup-policy: disarmed …`
+line stamped at the moment of the sleep.
+
+Two other findings from the same crash:
+
+- **7.0.0-38 still carries the bug.** Its changelog contains `Fix ttm_bo_swapout() infinite
+  LRU walk` but not the fix, and `ttm-fix-check` reports `buggy / buggy`. Keep rebooting after
+  any image is written.
+- **The 10:54 hybrid-sleep didn't come from the lid.** logind logged `The system will hybrid
+  sleep now!` with no `Lid closed` or power-key event, and nothing in the lid config picks
+  hybrid-sleep. It's an explicit request from something not yet identified (the only other
+  one was Sep 17 12:48). Since hybrid-sleep writes an image on every sleep, even a short
+  nap arms the bug.
+
+The full crash record is in the separate `framework13-issues` repo,
+`issues/2026-09-27-amdgpu-ttm-lru-corruption-panic.md`.
+
 ---
 
 ## Part 10 — Part 8's panic, named — and the capture kernel that ate the image
@@ -1763,7 +1818,7 @@ capture-kernel boot after a hibernation as a lost session.
 |---|---|
 | `/usr/local/sbin/framework-wakeup-policy` | Disarms all wake sources except lid, power button, RTC. Aborts without changes if it can't find lid + power button. Also sets `pm_debug_messages=1`. |
 | `/etc/systemd/system/framework-wakeup-policy.service` | Applies the policy at boot (`After=basic.target`, `Before=sleep.target`) |
-| `/etc/systemd/system-sleep/framework-wakeup-policy` | **Re-applies before every sleep** — the important one; catches USB/UCSI drift. `timeout 15` guarded, since systemd waits on sleep hooks. |
+| `/usr/lib/systemd/system-sleep/framework-wakeup-policy` | **Re-applies before every sleep** — the important one; catches USB/UCSI drift. `timeout 15` guarded, since systemd waits on sleep hooks. |
 | `/etc/polkit-1/rules.d/10-enable-hibernate.rules` | Overrides Ubuntu's blanket hibernate denial (local + active only) |
 | `/etc/systemd/sleep.conf.d/10-hibernate-delay.conf` | `HibernateDelaySec=2h`, `HibernateOnACPower=no` |
 | `/etc/systemd/logind.conf.d/10-lid-sleep.conf` | `HandleLidSwitch=sleep` (+ external power) |
@@ -1776,7 +1831,7 @@ capture-kernel boot after a hibernation as a lost session.
 | `~/.local/bin/suspend-report` | Health report on the last suspend cycle |
 | `~/.local/bin/ttm-fix-check` | Classifies the running kernel and the apt candidate as clean / buggy / fixed for the drm/ttm bulk_move bug, from the Ubuntu changelog; notifies on change ([Part 9](#part-9--a-lockup-an-hour-after-resume-the-drmttm-bulk_move-bug)) |
 | `~/.config/systemd/user/ttm-fix-check.{service,timer}` | Runs it daily (`Persistent=true`) |
-| `/etc/systemd/system-sleep/zz-hibernate-resume-warn` | `post`-phase sleep hook: if this boot has written a hibernation image since the last wake, schedules a 3 s system timer that launches the warning in every graphical user's session — two stages, because the hook runs while `user.slice` is still frozen ([Part 9](#second-occurrence-2026-09-19--and-the-warning-that-never-fired)). State in `/run/hibernate-resume-warn.count`; logs as `hibernate-resume-warn`. |
+| `/usr/lib/systemd/system-sleep/zz-hibernate-resume-warn` | `post`-phase sleep hook: if this boot has written a hibernation image since the last wake, schedules a 3 s system timer that launches the warning in every graphical user's session — two stages, because the hook runs while `user.slice` is still frozen ([Part 9](#second-occurrence-2026-09-19--and-the-warning-that-never-fired)). State in `/run/hibernate-resume-warn.count`; logs as `hibernate-resume-warn`. |
 | `/usr/local/bin/hibernate-resume-warn` | The warning itself: critical notification + zenity **Reboot now / Later** dialog. `--quiet` prints this boot's image count; no args warns only if it is > 0. |
 | `/etc/default/grub` | `resume=UUID=<your-swap-uuid>` appended — **no `resume_offset`** — plus `crash_kexec_post_notifiers=1` so a panic reaches `pstore` before the kexec jump ([Part 8](#part-8--a-panic-during-hibernation-and-no-vmcore)); timestamped `.bak` alongside |
 | `/etc/fstab` | swap entry now `UUID=<your-swap-uuid>`; the old `/swap.img` line commented out, timestamped `.bak` alongside |
@@ -1803,6 +1858,10 @@ kernel 7.0.0-31          = carries the drm/ttm bulk_move bug (Part 9); fix not
                            yet in Ubuntu. ttm-fix-check.timer enabled, reports
                            "buggy / buggy". Operating rule: reboot after any
                            hibernation resume.
+                           2026-10-02: 7.0.0-38 is still "buggy / buggy".
+sleep hooks              = in /usr/lib/systemd/system-sleep/ since 2026-10-03.
+                           systemd 259 never ran them from /etc/ (Part 9,
+                           third occurrence). Post test PASS 2026-10-03.
 kdump capture cmdline    = still activates swap from fstab and ERASES a pending
                            hibernation image (Part 10). Fix proposed, not applied.
 ```
@@ -1912,8 +1971,8 @@ sudo cat /var/lib/systemd/pstore/<epoch-prefix>*/*/dmesg.txt \
 # anything that matters, until the drm/ttm fix ships; see Part 9)
 journalctl -b -k | grep -c 'Hibernation image restored successfully'
 hibernate-resume-warn --quiet          # same question, counting images WRITTEN this boot
-sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake; dialog iff count rose
-sudo /etc/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog unconditionally, ~3 s later
+sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post hibernate   # simulate a wake; dialog iff count rose
+sudo /usr/lib/systemd/system-sleep/zz-hibernate-resume-warn post test        # dialog unconditionally, ~3 s later
 journalctl -b -t hibernate-resume-warn                                   # did it fire, and did the dialog start?
 
 # COUNT REAL HIBERNATIONS, not sleep attempts.  "Operation 'suspend-then-
@@ -2228,7 +2287,7 @@ A healthy cycle shows `Attempting to hibernate` → `Performing sleep operation 
 **Remove both test files afterwards.**
 
 If it turns out to be genuinely intermittent, the fallback is an explicit
-`/etc/systemd/system-sleep/` hook: record a target timestamp and arm the RTC on
+`/usr/lib/systemd/system-sleep/` hook: record a target timestamp and arm the RTC on
 suspend, then on wake compare wall-clock against the target and trigger
 hibernate if the deadline passed. No inference, nothing to be flaky.
 
@@ -2272,7 +2331,7 @@ echo enabled | sudo tee /sys/devices/platform/i8042/serio0/power/wakeup
 ```bash
 sudo systemctl disable --now framework-wakeup-policy.service
 sudo rm /etc/systemd/system/framework-wakeup-policy.service \
-        /etc/systemd/system-sleep/framework-wakeup-policy \
+        /usr/lib/systemd/system-sleep/framework-wakeup-policy \
         /usr/local/sbin/framework-wakeup-policy
 sudo systemctl daemon-reload
 # wake sources return to kernel defaults on next reboot

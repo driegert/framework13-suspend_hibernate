@@ -1047,7 +1047,7 @@ HandleLidSwitchExternalPower=suspend</code></pre>
     <tbody>
       <tr><td><code>/usr/local/sbin/framework-wakeup-policy</code></td><td>Disarms all wake sources except lid, power button, RTC. Aborts without changes if it can't find lid + power button. Also sets <code>pm_debug_messages=1</code>.</td></tr>
       <tr><td><code>/etc/systemd/system/framework-wakeup-policy.service</code></td><td>Applies the policy at boot.</td></tr>
-      <tr><td><code>/etc/systemd/system-sleep/framework-wakeup-policy</code></td><td><strong>Re-applies before every sleep</strong> — the important one. <code>timeout 15</code> guarded, since systemd waits on sleep hooks.</td></tr>
+      <tr><td><code>/usr/lib/systemd/system-sleep/framework-wakeup-policy</code></td><td><strong>Re-applies before every sleep</strong> — the important one. <code>timeout 15</code> guarded, since systemd waits on sleep hooks.</td></tr>
       <tr><td><code>/etc/polkit-1/rules.d/10-enable-hibernate.rules</code></td><td>Overrides Ubuntu's blanket hibernate denial (local + active only).</td></tr>
       <tr><td><code>/etc/systemd/sleep.conf.d/10-hibernate-delay.conf</code></td><td><code>HibernateDelaySec=2h</code>, <code>HibernateOnACPower=no</code></td></tr>
       <tr><td><code>/usr/local/sbin/stale-kernel-lid-guard</code></td><td>Forces plain suspend on a lid close while the running kernel isn't the newest installed. <code>--status</code>, <code>--self-test</code>.</td></tr>
@@ -1194,7 +1194,7 @@ journalctl -b -u systemd-suspend-then-hibernate | grep -E "Starting|Attempting|P
   <h4>Wake-source policy</h4>
 <pre><code>sudo systemctl disable --now framework-wakeup-policy.service
 sudo rm /etc/systemd/system/framework-wakeup-policy.service \
-        /etc/systemd/system-sleep/framework-wakeup-policy \
+        /usr/lib/systemd/system-sleep/framework-wakeup-policy \
         /usr/local/sbin/framework-wakeup-policy
 sudo systemctl daemon-reload
 # wake sources return to kernel defaults on next reboot</code></pre>
